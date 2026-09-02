@@ -50,8 +50,10 @@ asked.
 
 ### Requirements
 
-OmaGlass shells out to standard system tools rather than bundling any code.
-Everything below except `whois` ships with a stock Omarchy install:
+None — nothing to install beyond the command above. OmaGlass shells out to
+standard system tools that already ship with a stock Omarchy install, and
+speaks the whois protocol itself over a raw socket rather than depending on
+a separate `whois` package:
 
 | Tool | Used for |
 | --- | --- |
@@ -61,13 +63,7 @@ Everything below except `whois` ships with a stock Omarchy install:
 | `getent` (glibc) | Reverse-DNS hostnames in Usage |
 | `curl` | Batched GeoIP lookups |
 | `wl-copy` (wl-clipboard) | Clipboard copy actions |
-| `whois` | On-demand IP lookups from Connections |
-
-If `whois` isn't already on your system:
-
-```bash
-omarchy pkg add whois
-```
+| `bash` (`/dev/tcp`) | On-demand IP whois lookups from Connections |
 
 ## Removal
 
@@ -83,8 +79,8 @@ omarchy plugin remove io.github.cjohnson46.omaglass
   [ip-api.com](https://ip-api.com), a free public GeoIP service: only public
   IPs you're already connected to are sent, batched together. Private/local
   addresses are never looked up.
-- Whois lookups run against the standard `whois` service for the address you
-  clicked.
+- Whois lookups speak the whois protocol directly to IANA's registry
+  servers for the address you clicked (no external `whois` binary).
 - Reverse-DNS hostnames come from `getent` against your own configured DNS
   resolver.
 - Background sampling runs at full speed only while the popup is open;

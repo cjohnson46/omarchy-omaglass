@@ -126,7 +126,7 @@ Column {
       width: parent.width
       wrapMode: Text.WordWrap
       textFormat: Text.PlainText
-      text: "Clicking an IP in Connections runs a whois lookup against the standard whois service for that address. The new-app notification watches for process names you haven't seen talk to the network yet this session and sends one low-priority desktop notification -- nothing is blocked, it's just a heads-up."
+      text: "Clicking an IP in Connections runs a whois lookup for that address, spoken directly to IANA's registry servers -- no external whois tool required. The new-app notification watches for process names you haven't seen talk to the network yet this session and sends one low-priority desktop notification -- nothing is blocked, it's just a heads-up."
       color: panel.mutedText
       font.family: Style.font.family
       font.pixelSize: Style.font.caption

@@ -488,7 +488,34 @@ Panel {
   Process {
     id: whoisProc
     property string targetIp: ""
-    command: ["whois", targetIp]
+    // No external `whois` binary required -- this speaks the WHOIS
+    // protocol (RFC 3912: connect on TCP/43, send "query\r\n", read until
+    // the peer closes) directly over bash's /dev/tcp, so the plugin has no
+    // dependency beyond what a stock Omarchy install already has. Queries
+    // IANA's root server first and follows its one `refer:` pointer to the
+    // actual regional registry (ARIN/RIPE/APNIC/LACNIC/AFRINIC) for the
+    // real record -- the same single-hop referral chase the standalone
+    // `whois` CLI does for IP lookups. `timeout` bounds each hop so an
+    // unreachable/slow server can't hang the popup indefinitely.
+    command: ["bash", "-c", `
+      TARGET_IP="$1"
+      export TARGET_IP
+      q() {
+        timeout 8 bash -c '
+          exec 3<>"/dev/tcp/$1/43" || exit 1
+          printf "%s\\r\\n" "$TARGET_IP" >&3
+          cat <&3
+        ' _ "$1"
+      }
+      resp1=$(q whois.iana.org) || { echo "Could not reach the whois service."; exit 0; }
+      refer=$(printf '%s\\n' "$resp1" | grep -i '^refer:' | head -1 | sed 's/^[Rr]efer:[[:space:]]*//' | tr -d '\\r\\n ')
+      if [ -n "$refer" ]; then
+        resp2=$(q "$refer")
+        if [ -n "$resp2" ]; then printf '%s\\n' "$resp2"; else printf '%s\\n' "$resp1"; fi
+      else
+        printf '%s\\n' "$resp1"
+      fi
+    `, "_", targetIp]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {

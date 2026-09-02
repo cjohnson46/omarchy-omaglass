@@ -30,7 +30,8 @@ None of these are distributed with this repository:
 - `omarchy-network-status` (part of Omarchy) — interface/link status
 - `ss` (iproute2) — socket/connection and byte-counter sampling
 - `ip` (iproute2) — LAN neighbor discovery (`ip neigh show`)
-- `whois` — on-demand IP lookups from the Connections tab
+- `bash` (`/dev/tcp`) — on-demand IP whois lookups from the Connections tab,
+  spoken directly over TCP/43 rather than via a separate `whois` binary
 - `getent` (glibc) — reverse-DNS hostname lookups in the Usage tab
 - `curl` — batched GeoIP lookups against `ip-api.com`
 - `wl-copy` (wl-clipboard) — clipboard copy actions
