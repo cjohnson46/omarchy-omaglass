@@ -117,7 +117,7 @@ Column {
       width: parent.width
       wrapMode: Text.WordWrap
       textFormat: Text.PlainText
-      text: "Connections and usage totals come from your own processes' sockets (via ss, including the kernel's own byte counters for Usage), and devices come from your local network's neighbor table (via ip neigh) -- all of that stays on this machine. Country flags and Usage's Countries column are looked up from ip-api.com, a free public GeoIP service: only public IPs you're already connected to are sent, batched together, and private/local addresses are never looked up. Hostnames in Usage come from a reverse-DNS lookup (getent) against your configured DNS resolver."
+      text: "Connections and usage totals come from your own processes' sockets (via ss, including the kernel's own byte counters for Usage), and devices come from your local network's neighbor table (via ip neigh) -- all of that stays on this machine. Country flags and Usage's Countries column are looked up over HTTPS from ipwho.is, a free public GeoIP service, one address at a time: only public IPs you're already connected to are ever looked up, and private/local addresses are never sent. Hostnames in Usage come from a reverse-DNS lookup (getent) against your configured DNS resolver."
       color: panel.mutedText
       font.family: Style.font.family
       font.pixelSize: Style.font.caption

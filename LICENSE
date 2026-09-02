@@ -33,9 +33,10 @@ None of these are distributed with this repository:
 - `bash` (`/dev/tcp`) — on-demand IP whois lookups from the Connections tab,
   spoken directly over TCP/43 rather than via a separate `whois` binary
 - `getent` (glibc) — reverse-DNS hostname lookups in the Usage tab
-- `curl` — batched GeoIP lookups against `ip-api.com`
+- `curl` — GeoIP lookups against `ipwho.is`, one address per HTTPS request
 - `wl-copy` (wl-clipboard) — clipboard copy actions
 
-At runtime, only public IPs you are already connected to are sent (batched)
-to `ip-api.com`, a free public GeoIP service; private/local addresses are
-never looked up. See the in-app Settings tab for the full data/privacy notes.
+At runtime, only public IPs you are already connected to are ever looked up
+(one per HTTPS request, over TLS) against `ipwho.is`, a free public GeoIP
+service; private/local addresses are never sent. See the in-app Settings tab
+for the full data/privacy notes.

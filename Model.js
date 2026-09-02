@@ -95,7 +95,10 @@ function parseConnections(raw) {
 // process is enough -- no need to re-sort.
 function groupConnectionsByProcess(connections) {
   var order = []
-  var groups = {}
+  // Object.create(null): `key` comes from a process name string parsed out
+  // of `ss` output, so a process legitimately (or maliciously) named
+  // e.g. "__proto__" must not collide with Object.prototype.
+  var groups = Object.create(null)
   for (var i = 0; i < connections.length; i++) {
     var c = connections[i]
     var key = c.process || "Unknown"
@@ -129,23 +132,50 @@ function parseNeighbors(raw) {
 
 // -- IP helpers ---------------------------------------------------------------
 
+// Whether an address is non-global -- private, loopback, link-local,
+// documentation/test, multicast, or otherwise not something that should
+// ever be disclosed to a third-party lookup service. Deliberately
+// conservative: anything malformed or not recognized as a normal global
+// unicast address is treated as private (fails closed), since the only
+// consequence of a false positive here is skipping a GeoIP/whois lookup,
+// while a false negative would leak a non-routable address externally.
 function isPrivateIp(ip) {
-  var s = String(ip || "")
+  var s = String(ip || "").trim()
   if (!s) return true
-  if (s === "127.0.0.1" || s === "::1" || s === "localhost") return true
+  if (s === "127.0.0.1" || s === "::1" || s === "::" || s === "localhost") return true
+
   if (s.indexOf(":") !== -1) {
     var lower = s.toLowerCase()
-    return lower.indexOf("fe80:") === 0 || lower.indexOf("fc") === 0 || lower.indexOf("fd") === 0
+    // IPv4-mapped IPv6 (::ffff:a.b.c.d) -- re-check the embedded IPv4.
+    var mapped = lower.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/)
+    if (mapped) return isPrivateIp(mapped[1])
+    if (lower.indexOf("fe80:") === 0) return true // link-local, fe80::/10 (practical form)
+    if (lower.indexOf("fc") === 0 || lower.indexOf("fd") === 0) return true // unique local, fc00::/7
+    if (lower.indexOf("ff") === 0) return true // multicast, ff00::/8
+    if (lower.indexOf("2001:db8") === 0) return true // documentation, 2001:db8::/32
+    if (lower.indexOf("::") === 0 && lower !== "::") return true // catches any other all-zero-prefixed edge case conservatively
+    return false
   }
+
   var parts = s.split(".")
   if (parts.length !== 4) return true
   var a = Number(parts[0])
   var b = Number(parts[1])
-  if (a === 10) return true
-  if (a === 192 && b === 168) return true
-  if (a === 172 && b >= 16 && b <= 31) return true
-  if (a === 169 && b === 254) return true
-  if (a === 127) return true
+  var c = Number(parts[2])
+  if (!isFinite(a) || !isFinite(b) || !isFinite(c) || a < 0 || a > 255 || b < 0 || b > 255 || c < 0 || c > 255) return true
+  if (a === 0) return true // "this network", 0.0.0.0/8
+  if (a === 10) return true // RFC1918, 10/8
+  if (a === 100 && b >= 64 && b <= 127) return true // CGNAT, 100.64/10
+  if (a === 127) return true // loopback, 127/8
+  if (a === 169 && b === 254) return true // link-local, 169.254/16
+  if (a === 172 && b >= 16 && b <= 31) return true // RFC1918, 172.16/12
+  if (a === 192 && b === 0 && c === 0) return true // IETF protocol assignments, 192.0.0/24
+  if (a === 192 && b === 0 && c === 2) return true // TEST-NET-1, 192.0.2/24
+  if (a === 192 && b === 168) return true // RFC1918, 192.168/16
+  if (a === 198 && (b === 18 || b === 19)) return true // benchmarking, 198.18/15
+  if (a === 198 && b === 51 && c === 100) return true // TEST-NET-2, 198.51.100/24
+  if (a === 203 && b === 0 && c === 113) return true // TEST-NET-3, 203.0.113/24
+  if (a >= 224) return true // multicast (224/4) + reserved/future (240/4) + broadcast
   return false
 }
 
@@ -161,27 +191,24 @@ function countryFlagEmoji(code) {
   return String.fromCodePoint(0x1F1E6 + (c0 - 65)) + String.fromCodePoint(0x1F1E6 + (c1 - 65))
 }
 
-// -- ip-api.com batch response parsing ---------------------------------------
+// -- ipwho.is response parsing -------------------------------------------------
+//
+// One IP looked up per call (see Panel.qml's geo lookup queue) rather than a
+// batch, so this only ever needs to pick two fixed, known property names off
+// one parsed object -- no dynamic keys, so there's no map to defend against
+// a hostile `__proto__`-shaped payload in the first place.
 
-function parseGeoBatch(raw) {
-  var out = {}
+function parseGeoSingle(raw) {
   try {
-    var arr = JSON.parse(raw)
-    if (Array.isArray(arr)) {
-      for (var i = 0; i < arr.length; i++) {
-        var item = arr[i]
-        if (item && item.query) {
-          out[item.query] = {
-            countryCode: item.status === "success" ? (item.countryCode || "") : "",
-            country: item.status === "success" ? (item.country || "") : ""
-          }
-        }
-      }
+    var item = JSON.parse(raw)
+    if (!item || item.success !== true) return null
+    return {
+      countryCode: String(item.country_code || ""),
+      country: String(item.country || "")
     }
   } catch (e) {
-    // Malformed/empty response -- leave the cache as it was.
+    return null
   }
-  return out
 }
 
 // -- `ss -tiepn` parsing (TCP, extended info, process, numeric ports) --------
@@ -266,7 +293,11 @@ function serviceName(port) {
 // by bytes descending, each with its share of the total for proportional
 // bars.
 function aggregateBytes(list, keyFn) {
-  var totals = {}
+  // Object.create(null): keys here can be reverse-DNS hostnames or process
+  // names -- both are strings an attacker on the other end of a connection
+  // has some influence over (a PTR record, a process's own argv[0]), so a
+  // plain {} would let a key like "__proto__" collide with Object.prototype.
+  var totals = Object.create(null)
   var totalBytes = 0
   for (var i = 0; i < list.length; i++) {
     var item = list[i]

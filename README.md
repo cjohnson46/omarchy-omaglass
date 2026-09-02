@@ -80,11 +80,13 @@ omarchy plugin remove io.github.cjohnson46.omaglass
 - Connections, usage, and device data all come from your own machine (`ss`,
   `ip neigh`) — none of it leaves your computer.
 - Country flags and Usage's Countries column come from
-  [ip-api.com](https://ip-api.com), a free public GeoIP service: only public
-  IPs you're already connected to are sent, batched together. Private/local
-  addresses are never looked up.
-- Whois lookups speak the whois protocol directly to IANA's registry
-  servers for the address you clicked (no external `whois` binary).
+  [ipwho.is](https://ipwho.is), a free public GeoIP service, over HTTPS, one
+  address per request: only public IPs you're already connected to are ever
+  looked up. Private/local addresses are never sent.
+- Whois lookups speak the whois protocol directly to IANA and, for the
+  handful of real regional registries on a fixed allowlist, whichever one
+  IANA refers to (no external `whois` binary, and no other host is ever
+  connected to).
 - Reverse-DNS hostnames come from `getent` against your own configured DNS
   resolver.
 - Background sampling runs at full speed only while the popup is open;

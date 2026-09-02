@@ -183,9 +183,13 @@ Panel {
     root.syncTick++
   }
 
+  // `timeout` bounds worst-case run time -- this fires as often as once a
+  // second while the popup is open, so a wedged call needs to die well
+  // before the next tick rather than piling up -- and `head -c` bounds how
+  // much output is ever buffered, regardless of what the producer writes.
   Process {
     id: statusProc
-    command: ["omarchy-network-status", "--verbose"]
+    command: ["bash", "-c", "timeout --kill-after=1 3 omarchy-network-status --verbose | head -c 20000"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.sample(text)
@@ -294,7 +298,7 @@ Panel {
 
   Process {
     id: lanStatsProc
-    command: ["ss", "-tiepn"]
+    command: ["bash", "-c", "timeout --kill-after=1 3 ss -tiepn | head -c 400000"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.sampleLan(text)
@@ -324,10 +328,7 @@ Panel {
       if (!Model.isPrivateIp(ip) && !root.geoCache[ip] && toLookup.indexOf(ip) === -1)
         toLookup.push(ip)
     }
-    if (toLookup.length > 0) {
-      geoProc.pendingIps = toLookup
-      geoProc.running = true
-    }
+    root.queueGeoLookups(toLookup)
 
     root.checkNewApps(root.connections)
   }
@@ -340,9 +341,13 @@ Panel {
     return (flag ? flag + " " : "") + g.countryCode
   }
 
+  // `timeout` bounds worst-case run time (a wedged `ss` shouldn't be able to
+  // hang this popup or pile up indefinitely across ticks) and `head -c`
+  // bounds how much output we'll ever buffer into memory/StdioCollector,
+  // regardless of how much the producer actually writes.
   Process {
     id: connectionsProc
-    command: ["ss", "-tup"]
+    command: ["bash", "-c", "timeout --kill-after=1 4 ss -tup | head -c 400000"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.handleConnections(text)
@@ -372,7 +377,11 @@ Panel {
   property int newAppAlertCount: 0
 
   function checkNewApps(list) {
-    var stillSeen = {}
+    // Object.create(null): `name` is a process name straight out of `ss`
+    // output -- a locally-running process can name itself anything,
+    // including "__proto__", which a plain {} would let collide with
+    // Object.prototype.
+    var stillSeen = Object.create(null)
     for (var k in root.seenProcesses) stillSeen[k] = true
     var freshNames = []
     for (var i = 0; i < list.length; i++) {
@@ -405,16 +414,64 @@ Panel {
       "New app on your network", body]
   }
 
+  // One IP looked up per request against ipwho.is over real HTTPS, queued
+  // and processed one at a time (same shape as the reverse-DNS queue
+  // below) -- not batched. ip-api.com (used previously) turned out to
+  // reject HTTPS entirely on its free tier ("SSL unavailable for this
+  // endpoint", confirmed directly against its API), which meant every
+  // lookup went out in cleartext and, being a single POST of the *entire*
+  // pending batch, put the complete list of a user's current remote IPs in
+  // one place: the request body, which curl also exposed via argv (visible
+  // to any other local process reading /proc/<pid>/cmdline while it ran).
+  // One HTTPS GET per address fixes the transport (encrypted, can't be
+  // silently tampered with in transit) and means at most a single address
+  // is ever in flight at once, the same as any other simple GET-based CLI
+  // lookup -- not a standing list of everywhere the user is connected.
+  property var pendingGeoQueue: []
+  property string geoLookupTarget: ""
+
+  function queueGeoLookups(ips) {
+    var q = root.pendingGeoQueue.slice()
+    for (var i = 0; i < ips.length; i++) {
+      // Capped so a burst of many distinct new remote IPs at once can't
+      // grow this queue without bound.
+      if (q.indexOf(ips[i]) === -1 && q.length < 200) q.push(ips[i])
+    }
+    root.pendingGeoQueue = q
+    root.processNextGeoLookup()
+  }
+
+  function processNextGeoLookup() {
+    if (root.geoLookupTarget !== "" || root.pendingGeoQueue.length === 0) return
+    var q = root.pendingGeoQueue.slice()
+    root.geoLookupTarget = q.shift()
+    root.pendingGeoQueue = q
+    geoProc.running = true
+  }
+
   Process {
     id: geoProc
-    property var pendingIps: []
-    command: ["curl", "-s", "--max-time", "5", "-X", "POST",
-      "-H", "Content-Type: application/json",
-      "-d", JSON.stringify(pendingIps),
-      "http://ip-api.com/batch?fields=status,countryCode,country,query"]
+    // --proto/--tlsv1.2: refuse anything but a real, modern-TLS HTTPS
+    // connection outright (no silent downgrade). --max-redirs 0: never
+    // follow a redirect to an unexpected host. --fail: don't treat an
+    // HTTP error page as a real response. `timeout` bounds total run time;
+    // `head -c` bounds how much of the response we'll ever read.
+    command: ["bash", "-c",
+      "timeout --kill-after=2 6 curl -sS --max-time 5 --connect-timeout 3 --proto '=https' --tlsv1.2 --max-redirs 0 --fail \"https://ipwho.is/$1\" | head -c 8000",
+      "_", root.geoLookupTarget]
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.handleGeoBatch(text)
+      onStreamFinished: {
+        var parsed = Model.parseGeoSingle(text)
+        if (parsed) {
+          var merged = {}
+          for (var k in root.geoCache) merged[k] = root.geoCache[k]
+          merged[root.geoLookupTarget] = parsed
+          root.geoCache = root.capCache(merged, 500)
+        }
+        root.geoLookupTarget = ""
+        root.processNextGeoLookup()
+      }
     }
   }
 
@@ -430,14 +487,6 @@ Panel {
     var out = {}
     for (var i = drop; i < keys.length; i++) out[keys[i]] = obj[keys[i]]
     return out
-  }
-
-  function handleGeoBatch(text) {
-    var results = Model.parseGeoBatch(text)
-    var merged = {}
-    for (var k in root.geoCache) merged[k] = root.geoCache[k]
-    for (var k2 in results) merged[k2] = results[k2]
-    root.geoCache = root.capCache(merged, 500)
   }
 
   // ---- whois, on demand ----------------------------------------------------
@@ -493,28 +542,45 @@ Panel {
     // the peer closes) directly over bash's /dev/tcp, so the plugin has no
     // dependency beyond what a stock Omarchy install already has. Queries
     // IANA's root server first and follows its one `refer:` pointer to the
-    // actual regional registry (ARIN/RIPE/APNIC/LACNIC/AFRINIC) for the
-    // real record -- the same single-hop referral chase the standalone
-    // `whois` CLI does for IP lookups. `timeout` bounds each hop so an
-    // unreachable/slow server can't hang the popup indefinitely.
-    command: ["bash", "-c", `
+    // actual regional registry for the real record -- the same
+    // single-hop referral chase the standalone `whois` CLI does for IP
+    // lookups.
+    //
+    // The referral target is checked against a fixed allowlist of the
+    // five real regional internet registries before it's ever connected
+    // to: `refer:` is taken verbatim from IANA's plaintext, unauthenticated
+    // response, so a network attacker able to tamper with or spoof that
+    // response could otherwise redirect this connection to an arbitrary
+    // host of their choosing (including an internal/link-local address).
+    // If the value isn't one of these five, the plugin simply keeps IANA's
+    // own response instead of connecting anywhere else.
+    //
+    // The whole two-hop lookup runs under one absolute `timeout` (rather
+    // than one per hop, which could add up to double the wait) and each
+    // socket read is capped with `head -c` so a slow, hostile, or
+    // just-broken server can't hang the popup or hand back unbounded data.
+    // The `Process` type has no built-in run-time-limit property, so the
+    // single absolute deadline for both hops together is enforced by
+    // wrapping the whole bash invocation in the `timeout` command itself.
+    command: ["timeout", "--kill-after=2", "12", "bash", "-c", `
       TARGET_IP="$1"
-      export TARGET_IP
+      RIR_ALLOWLIST=" whois.arin.net whois.ripe.net whois.apnic.net whois.lacnic.net whois.afrinic.net "
       q() {
-        timeout 8 bash -c '
-          exec 3<>"/dev/tcp/$1/43" || exit 1
-          printf "%s\\r\\n" "$TARGET_IP" >&3
-          cat <&3
-        ' _ "$1"
+        exec 3<>"/dev/tcp/$1/43" || return 1
+        printf "%s\\r\\n" "$TARGET_IP" >&3
+        head -c 65536 <&3
       }
       resp1=$(q whois.iana.org) || { echo "Could not reach the whois service."; exit 0; }
-      refer=$(printf '%s\\n' "$resp1" | grep -i '^refer:' | head -1 | sed 's/^[Rr]efer:[[:space:]]*//' | tr -d '\\r\\n ')
-      if [ -n "$refer" ]; then
-        resp2=$(q "$refer")
-        if [ -n "$resp2" ]; then printf '%s\\n' "$resp2"; else printf '%s\\n' "$resp1"; fi
-      else
-        printf '%s\\n' "$resp1"
-      fi
+      refer=$(printf '%s\\n' "$resp1" | grep -i '^refer:' | head -1 | sed 's/^[Rr]efer:[[:space:]]*//' | tr -d '\\r\\n ' | tr 'A-Z' 'a-z')
+      case "$RIR_ALLOWLIST" in
+        *" $refer "*)
+          resp2=$(q "$refer")
+          if [ -n "$resp2" ]; then printf '%s\\n' "$resp2"; else printf '%s\\n' "$resp1"; fi
+          ;;
+        *)
+          printf '%s\\n' "$resp1"
+          ;;
+      esac
     `, "_", targetIp]
     stdout: StdioCollector {
       waitForEnd: true
@@ -538,7 +604,7 @@ Panel {
 
   Process {
     id: devicesProc
-    command: ["ip", "neigh", "show"]
+    command: ["bash", "-c", "timeout --kill-after=1 4 ip neigh show | head -c 100000"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.devices = Model.parseNeighbors(text)
@@ -583,17 +649,16 @@ Panel {
         if (root.hostCache[ip] === undefined && hostLookup.indexOf(ip) === -1) hostLookup.push(ip)
       }
     }
-    if (geoLookup.length > 0) {
-      geoProc.pendingIps = geoLookup
-      geoProc.running = true
-    }
+    root.queueGeoLookups(geoLookup)
     root.queueHostLookups(hostLookup)
   }
 
   function queueHostLookups(ips) {
     var q = root.pendingHostQueue.slice()
     for (var i = 0; i < ips.length; i++) {
-      if (q.indexOf(ips[i]) === -1) q.push(ips[i])
+      // Capped so a burst of many distinct new remote IPs at once can't
+      // grow this queue without bound.
+      if (q.indexOf(ips[i]) === -1 && q.length < 200) q.push(ips[i])
     }
     root.pendingHostQueue = q
     root.processNextHostLookup()
@@ -646,7 +711,7 @@ Panel {
 
   Process {
     id: usageProc
-    command: ["ss", "-tiepn"]
+    command: ["bash", "-c", "timeout --kill-after=1 4 ss -tiepn | head -c 400000"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.handleUsage(text)
@@ -663,7 +728,7 @@ Panel {
 
   Process {
     id: hostProc
-    command: ["getent", "hosts", root.hostLookupTarget]
+    command: ["bash", "-c", "timeout --kill-after=1 3 getent hosts \"$1\" | head -c 4000", "_", root.hostLookupTarget]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -758,13 +823,28 @@ Panel {
     onLoadFailed: root.applyThemeFile("")
   }
 
+  // Writes via a freshly-created, randomly-named temp file in the same
+  // directory (mktemp's O_CREAT|O_EXCL semantics -- never following an
+  // existing name) and then an atomic rename() over the real path, rather
+  // than a plain `>` redirect to a predictable filename. `>` truncates and
+  // writes through whatever is *already* at that path, symlink included --
+  // a symlink or FIFO planted there ahead of time would redirect the write
+  // or block it; an atomic rename replaces the directory entry itself
+  // instead. The directory and temp file are both created privately
+  // (0700/0600) rather than at the process's ambient umask.
   Process {
     id: themeWriteProc
     property string themeIdArg: ""
     property string monotoneArg: "true"
-    command: ["bash", "-c",
-      "mkdir -p \"$1\" && printf '{\"theme\":\"%s\",\"barMonotone\":%s}' \"$2\" \"$3\" > \"$1/theme.json\"",
-      "_", root.stateDir, themeIdArg, monotoneArg]
+    command: ["bash", "-c", `
+      DIR="$1"
+      mkdir -p -m 0700 "$DIR" || exit 1
+      umask 077
+      tmp=$(mktemp "$DIR/.theme.json.XXXXXX") || exit 1
+      printf '{"theme":"%s","barMonotone":%s}' "$2" "$3" > "$tmp"
+      chmod 0600 "$tmp"
+      mv -f "$tmp" "$DIR/theme.json"
+    `, "_", root.stateDir, themeIdArg, monotoneArg]
   }
 
   IpcHandler {
