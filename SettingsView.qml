@@ -109,6 +109,92 @@ Column {
     spacing: Style.space(6)
 
     PanelSectionHeader {
+      text: "Notifications"
+      foreground: Color.popups.text
+      fontFamily: Style.font.family
+    }
+
+    Toggle {
+      width: parent.width
+      label: "Notify on new apps"
+      description: "Send a desktop notification the first time a process starts talking to the network each session. Off by default -- the count still shows in the Usage tab either way."
+      checked: panel.newAppNotifications
+      foreground: Color.popups.text
+      accent: Color.accent
+      onClicked: panel.setNewAppNotifications(!panel.newAppNotifications)
+    }
+  }
+
+  PanelSeparator { foreground: Color.popups.text }
+
+  Column {
+    width: parent.width
+    spacing: Style.space(6)
+
+    PanelSectionHeader {
+      text: "Default Graph Window"
+      foreground: Color.popups.text
+      fontFamily: Style.font.family
+    }
+    Text {
+      width: parent.width
+      wrapMode: Text.WordWrap
+      textFormat: Text.PlainText
+      text: "Which window the Traffic tab's graph starts on when you open the popup. Picking a different window there for that session doesn't change this."
+      color: panel.mutedText
+      font.family: Style.font.family
+      font.pixelSize: Style.font.caption
+    }
+
+    Row {
+      spacing: Style.space(8)
+
+      Repeater {
+        model: [
+          { key: 30, label: "30s" },
+          { key: 120, label: "2m" },
+          { key: 600, label: "10m" },
+          { key: 1800, label: "30m" }
+        ]
+
+        Rectangle {
+          required property var modelData
+          readonly property bool active: panel.defaultHistoryWindowSeconds === modelData.key
+          width: Style.space(46)
+          height: Style.space(24)
+          radius: Style.space(12)
+          color: active
+            ? Util.alpha(Color.accent, 0.22)
+            : Qt.rgba(Color.popups.text.r, Color.popups.text.g, Color.popups.text.b, 0.06)
+          border.width: active ? 1 : 0
+          border.color: Color.accent
+
+          Text {
+            anchors.centerIn: parent
+            textFormat: Text.PlainText
+            text: modelData.label
+            color: active ? Color.popups.text : panel.mutedText
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: panel.setDefaultHistoryWindow(modelData.key)
+          }
+        }
+      }
+    }
+  }
+
+  PanelSeparator { foreground: Color.popups.text }
+
+  Column {
+    width: parent.width
+    spacing: Style.space(6)
+
+    PanelSectionHeader {
       text: "About This Data"
       foreground: Color.popups.text
       fontFamily: Style.font.family
@@ -126,7 +212,7 @@ Column {
       width: parent.width
       wrapMode: Text.WordWrap
       textFormat: Text.PlainText
-      text: "Clicking an IP in Connections runs a whois lookup for that address, spoken directly to IANA's registry servers -- no external whois tool required. The new-app notification watches for process names you haven't seen talk to the network yet this session and sends one low-priority desktop notification -- nothing is blocked, it's just a heads-up."
+      text: "Clicking an IP in Connections runs a whois lookup for that address, spoken directly to IANA's registry servers -- no external whois tool required. New-app tracking watches for process names you haven't seen talk to the network yet this session; the desktop notification for it is off by default (see Notifications above) -- nothing is ever blocked, it's just a heads-up when you opt in."
       color: panel.mutedText
       font.family: Style.font.family
       font.pixelSize: Style.font.caption

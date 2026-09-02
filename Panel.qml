@@ -67,7 +67,12 @@ Panel {
   property string ifaceType: ""
   property string ssid: ""
 
-  property int historyWindowSeconds: 120
+  // Starts out equal to the persisted default (see defaultHistoryWindowSeconds
+  // below, near the rest of the saved settings) -- this is a plain
+  // initializer, not a permanent binding, so clicking a window button in
+  // the Traffic tab still freely overrides it for just the current session
+  // without touching the saved default.
+  property int historyWindowSeconds: defaultHistoryWindowSeconds
 
   // Padded with leading zeros to always be exactly historyWindowSeconds long,
   // even in the first minutes of a session before that much real history
@@ -400,7 +405,12 @@ Panel {
     }
     if (freshNames.length === 0) return
 
+    // The Usage tab's "new apps" count keeps tracking either way -- it's a
+    // passive number, not an interruption -- but the OS desktop
+    // notification itself is opt-in (see newAppNotifications in Settings).
     root.newAppAlertCount += freshNames.length
+    if (!root.newAppNotifications) return
+
     notifyProc.body = freshNames.length === 1
       ? (freshNames[0] + " just started talking to the internet")
       : (freshNames.join(", ") + " just started talking to the internet")
@@ -775,6 +785,17 @@ Panel {
   readonly property color barGraphDownColor: root.barMonotone ? root.barForeground : root.downColor
   readonly property color barGraphUpColor: root.barMonotone ? root.barForeground : root.upColor
 
+  // Off by default -- opt-in, not opt-out. Only gates the OS desktop
+  // notification itself; the "new apps" count shown in the Usage tab keeps
+  // tracking regardless, since that's a passive in-app number rather than
+  // an interruption.
+  property bool newAppNotifications: false
+
+  // What historyWindowSeconds (the Traffic graph's window) starts out as on
+  // a fresh popup -- 120s (2m) until changed here. Picking a window in the
+  // Traffic tab itself only affects that session's live view, not this.
+  property int defaultHistoryWindowSeconds: 120
+
   function setTheme(id) {
     if (!Themes.exists(id)) return
     themeId = id
@@ -786,9 +807,21 @@ Panel {
     writeState()
   }
 
+  function setNewAppNotifications(enabled) {
+    newAppNotifications = enabled
+    writeState()
+  }
+
+  function setDefaultHistoryWindow(seconds) {
+    defaultHistoryWindowSeconds = seconds
+    writeState()
+  }
+
   function writeState() {
     themeWriteProc.themeIdArg = root.themeId
     themeWriteProc.monotoneArg = root.barMonotone ? "true" : "false"
+    themeWriteProc.notifyArg = root.newAppNotifications ? "true" : "false"
+    themeWriteProc.windowArg = String(root.defaultHistoryWindowSeconds)
     themeWriteProc.running = true
   }
 
@@ -801,6 +834,8 @@ Panel {
 
   readonly property string stateDir: Quickshell.env("HOME") + "/.local/state/omarchy/omaglass"
 
+  readonly property var validHistoryWindows: [30, 120, 600, 1800]
+
   function applyThemeFile(raw) {
     try {
       var parsed = JSON.parse(raw)
@@ -808,6 +843,10 @@ Panel {
         root.themeId = parsed.theme
       if (parsed && typeof parsed.barMonotone === "boolean")
         root.barMonotone = parsed.barMonotone
+      if (parsed && typeof parsed.newAppNotifications === "boolean")
+        root.newAppNotifications = parsed.newAppNotifications
+      if (parsed && root.validHistoryWindows.indexOf(parsed.defaultHistoryWindowSeconds) !== -1)
+        root.defaultHistoryWindowSeconds = parsed.defaultHistoryWindowSeconds
     } catch (e) {
       // No saved settings yet -- keep the defaults.
     }
@@ -836,15 +875,17 @@ Panel {
     id: themeWriteProc
     property string themeIdArg: ""
     property string monotoneArg: "true"
+    property string notifyArg: "false"
+    property string windowArg: "120"
     command: ["bash", "-c", `
       DIR="$1"
       mkdir -p -m 0700 "$DIR" || exit 1
       umask 077
       tmp=$(mktemp "$DIR/.theme.json.XXXXXX") || exit 1
-      printf '{"theme":"%s","barMonotone":%s}' "$2" "$3" > "$tmp"
+      printf '{"theme":"%s","barMonotone":%s,"newAppNotifications":%s,"defaultHistoryWindowSeconds":%s}' "$2" "$3" "$4" "$5" > "$tmp"
       chmod 0600 "$tmp"
       mv -f "$tmp" "$DIR/theme.json"
-    `, "_", root.stateDir, themeIdArg, monotoneArg]
+    `, "_", root.stateDir, themeIdArg, monotoneArg, notifyArg, windowArg]
   }
 
   IpcHandler {

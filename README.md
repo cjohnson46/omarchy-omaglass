@@ -14,10 +14,10 @@ discovery. Read-only: no firewall or blocking controls.
 ## Features
 
 - **Live speed gauges** for download/upload, with an auto-expanding scale.
-- **A smooth history graph** (30s/2m/10m/30m windows) plotting WAN and LAN
-  traffic as separate lines, with a hover tooltip and a pause button to
-  freeze the graph on a burst without pausing the live gauges/stats behind
-  it.
+- **A smooth history graph** (30s/2m/10m/30m windows, 2m by default -- set
+  your own default in Settings) plotting WAN and LAN traffic as separate
+  lines, with a hover tooltip and a pause button to freeze the graph on a
+  burst without pausing the live gauges/stats behind it.
 - **A tiny live graph right in the bar icon**, with a per-theme color pair or
   a neutral "match the other icons" mode (your choice, in Settings).
 - **Active Connections**, nested by process, each remote IP flagged by
@@ -27,8 +27,8 @@ discovery. Read-only: no firewall or blocking controls.
 - **Usage** breakdowns of real kernel byte counters by app, host, traffic
   type, and country.
 - **Devices** on your LAN, from your local ARP/neighbor table.
-- **A discreet notification** the first time a new process starts talking to
-  the network each session.
+- **An optional notification** the first time a new process starts talking
+  to the network each session -- off by default, toggle it on in Settings.
 - **Color themes** for the graph/gauges — pick a fixed pair, or stay on your
   live Omarchy theme (the default).
 
