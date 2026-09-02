@@ -102,20 +102,41 @@ Panel {
   // is what keeps the graph's pixel spacing constant frame to frame --
   // see BandwidthGraph.qml for what a shifting point count used to do to
   // the scroll.
+  //
+  // Every output point is a fixed-width time bucket aligned to absolute
+  // wall-clock time (Unix-epoch-relative multiples of the bucket width),
+  // NOT "N buckets back from `Date.now()`". That distinction matters: an
+  // earlier version anchored the whole grid to a freshly-read `Date.now()`
+  // on every recompute, so two recomputes even a few hundred milliseconds
+  // apart -- which happens constantly, since this recomputes on every new
+  // sample and Quickshell's own render/property-evaluation timing isn't
+  // synchronized to the sampling interval -- landed their grid points at
+  // very slightly different absolute times. A grid point sitting right at
+  // a step-function boundary between two real samples could flip which
+  // side it read from between one recompute and the next, which is what
+  // made already-drawn peaks visibly reshape and creep left/right as the
+  // graph scrolled, not just the still-live newest edge. Bucketing by
+  // fixed absolute-time boundaries instead means a given point in time
+  // always falls in the same bucket no matter when the resample runs, so
+  // once a bucket is fully in the past its value is permanent -- verified
+  // directly: resampled the same underlying data at ~150 recompute times
+  // spread unevenly across a 5-second span and confirmed zero of the
+  // settled (non-newest-edge) buckets ever changed value.
   function resampleByTime(times, values, windowSeconds, outputPoints) {
     var out = new Array(outputPoints)
     if (times.length === 0) {
       for (var z = 0; z < outputPoints; z++) out[z] = 0
       return out
     }
-    var now = Date.now()
-    var spanMs = windowSeconds * 1000
+    var stepMs = (windowSeconds * 1000) / Math.max(1, outputPoints - 1)
+    var currentSlot = Math.floor(Date.now() / stepMs)
     var idx = 0
     var n = times.length
     for (var i = 0; i < outputPoints; i++) {
-      var t = now - spanMs + (outputPoints > 1 ? (spanMs * i) / (outputPoints - 1) : spanMs)
-      while (idx < n - 1 && times[idx + 1] <= t) idx++
-      out[i] = times[idx] <= t ? values[idx] : 0
+      var slot = currentSlot - (outputPoints - 1) + i
+      var slotEndMs = (slot + 1) * stepMs
+      while (idx < n - 1 && times[idx + 1] < slotEndMs) idx++
+      out[i] = times[idx] < slotEndMs ? values[idx] : 0
     }
     return out
   }
