@@ -594,8 +594,28 @@ Panel {
     root.processNextGeoLookup()
   }
 
+  // Set on a failed/rate-limited lookup, cleared on success. While in
+  // effect, processNextGeoLookup below defers rather than firing more
+  // requests -- ipwho.is's free tier rate-limits per caller, and without
+  // this, the connections poll (every 6s, popup open or not) would just
+  // keep re-queuing every still-unresolved IP forever and hammering it the
+  // whole time. `handleConnections`'s own re-queue on the next poll is what
+  // resumes checking once this expires, no separate timer needed.
+  property real geoBackoffUntil: 0
+  property int geoBackoffMs: 0
+  readonly property int geoBackoffBaseMs: 30000
+  // Capped well under a real Retry-After (ipwho.is has been observed to
+  // send one in the tens of thousands of seconds for an exhausted daily
+  // quota) -- waiting out the exact value would mean not even retrying for
+  // the better part of a day on a single header read. Retrying at this
+  // cadence instead is still a small fraction of the request volume that
+  // caused the limit in the first place, while recovering promptly once it
+  // actually clears.
+  readonly property int geoBackoffMaxMs: 1800000
+
   function processNextGeoLookup() {
     if (root.geoLookupTarget !== "" || root.pendingGeoQueue.length === 0) return
+    if (Date.now() < root.geoBackoffUntil) return
     var q = root.pendingGeoQueue.slice()
     root.geoLookupTarget = q.shift()
     root.pendingGeoQueue = q
@@ -604,23 +624,38 @@ Panel {
 
   Process {
     id: geoProc
-    // --proto/--tlsv1.2: refuse anything but a real, modern-TLS HTTPS
-    // connection outright (no silent downgrade). --max-redirs 0: never
-    // follow a redirect to an unexpected host. --fail: don't treat an
-    // HTTP error page as a real response. `timeout` bounds total run time;
-    // `head -c` bounds how much of the response we'll ever read.
+    // -q must be curl's very first option (that's how curl itself decides
+    // whether to honor it at all) -- it disables reading ~/.curlrc, so an
+    // ambient config on the machine this plugin runs on can't silently add
+    // or change anything about this request despite every flag below being
+    // spelled out explicitly. --proto/--tlsv1.2: refuse anything but a
+    // real, modern-TLS HTTPS connection outright (no silent downgrade).
+    // --max-redirs 0: never follow a redirect to an unexpected host.
+    // `timeout` bounds total run time; `head -c` bounds how much of the
+    // response we'll ever read. No --fail here (unlike other lookups in
+    // this file) -- a rate-limit response's body and headers are exactly
+    // what tells the backoff logic below how long to actually wait, so
+    // this needs to see them rather than have curl discard them.
     command: ["bash", "-c",
-      "timeout --kill-after=2 6 curl -sS --max-time 5 --connect-timeout 3 --proto '=https' --tlsv1.2 --max-redirs 0 --fail \"https://ipwho.is/$1\" | head -c 8000",
+      "timeout --kill-after=2 6 curl -q -sS --max-time 5 --connect-timeout 3 --proto '=https' --tlsv1.2 --max-redirs 0 \"https://ipwho.is/$1\" -w '\\n@@GEOMETA@@%{http_code}@@%{header_json}' | head -c 8200",
       "_", root.geoLookupTarget]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var parsed = Model.parseGeoSingle(text)
-        if (parsed) {
+        var result = Model.parseGeoSingle(text)
+        if (result.country) {
           var merged = {}
           for (var k in root.geoCache) merged[k] = root.geoCache[k]
-          merged[root.geoLookupTarget] = parsed
+          merged[root.geoLookupTarget] = result.country
           root.geoCache = root.capCache(merged, 500)
+          root.geoBackoffMs = 0
+          root.geoBackoffUntil = 0
+        } else {
+          var backoffMs = result.retryAfterSeconds > 0
+            ? Math.min(result.retryAfterSeconds * 1000, root.geoBackoffMaxMs)
+            : (root.geoBackoffMs > 0 ? Math.min(root.geoBackoffMs * 2, root.geoBackoffMaxMs) : root.geoBackoffBaseMs)
+          root.geoBackoffMs = backoffMs
+          root.geoBackoffUntil = Date.now() + backoffMs
         }
         root.geoLookupTarget = ""
         root.processNextGeoLookup()
@@ -1042,6 +1077,11 @@ Panel {
 
   // ---- popup content ---------------------------------------------------------
 
+  // Pixels of scroll per unit of WheelEvent.angleDelta.y (typically ±120 for
+  // one physical notch, smaller/continuous for a trackpad). Roughly 3x a
+  // plain Flickable's own default notch step -- see the WheelHandler below.
+  readonly property real wheelScrollScale: 0.75
+
   KeyboardPanel {
     id: panel
     anchorItem: root.anchorItem
@@ -1067,6 +1107,23 @@ Panel {
         clip: true
         boundsBehavior: Flickable.StopAtBounds
         interactive: contentHeight > height
+
+        // Flickable's own built-in wheel handling moves content a small
+        // fixed amount per notch -- fine for a short list, but this popup's
+        // content (especially Settings and Connections, both several
+        // screens tall) took many notches to reach the bottom. WheelHandler
+        // intercepts the event ahead of Flickable's own handling (Qt Quick
+        // gives an Item's pointer handlers first refusal), so `target: null`
+        // plus a manual contentY adjustment fully replaces it rather than
+        // stacking on top of it.
+        WheelHandler {
+          target: null
+          onWheel: function(event) {
+            var maxY = Math.max(0, contentFlick.contentHeight - contentFlick.height)
+            var next = contentFlick.contentY - event.angleDelta.y * root.wheelScrollScale
+            contentFlick.contentY = Math.max(0, Math.min(maxY, next))
+          }
+        }
 
         Column {
           id: mainColumn

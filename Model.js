@@ -81,10 +81,28 @@ function parseConnections(raw) {
       pid: procMatch ? procMatch[2] : ""
     })
   }
+  // Sorted by process, then a full tiebreak on the connection's own
+  // identity (remote IP, then both ports) -- `ss`'s own row order for a
+  // given process's sockets isn't guaranteed stable between two separate
+  // invocations even when the actual socket set hasn't changed, and this
+  // runs every second while the popup's open. Process-only sorting left
+  // same-process rows free to swap position tick to tick with nothing
+  // backing their relative order, which read as the IP list constantly
+  // reshuffling -- annoying on its own, and it moved the row out from
+  // under the cursor mid-click. A full tiebreak means the same underlying
+  // connections always sort into the same order, so rows only actually
+  // move when a connection genuinely opens or closes.
   out.sort(function(a, b) {
     var an = a.process || "￿"
     var bn = b.process || "￿"
-    return an === bn ? 0 : (an < bn ? -1 : 1)
+    if (an !== bn) return an < bn ? -1 : 1
+    if (a.remoteIp !== b.remoteIp) return a.remoteIp < b.remoteIp ? -1 : 1
+    var ap = Number(a.remotePort) || 0
+    var bp = Number(b.remotePort) || 0
+    if (ap !== bp) return ap - bp
+    var alp = Number(a.localPort) || 0
+    var blp = Number(b.localPort) || 0
+    return alp - blp
   })
   return out
 }
@@ -198,17 +216,51 @@ function countryFlagEmoji(code) {
 // one parsed object -- no dynamic keys, so there's no map to defend against
 // a hostile `__proto__`-shaped payload in the first place.
 
+// `raw` is the response body plus a trailing marker the geoProc command
+// appends with curl's `-w`: the HTTP status and all response headers (as
+// JSON), so a rate limit (or any other non-2xx) can be told apart from a
+// malformed response and backed off from properly -- see geoBackoffMs in
+// Panel.qml for why that matters. Returns { country, httpCode,
+// retryAfterSeconds }; `country` is null on anything but a clean success.
 function parseGeoSingle(raw) {
+  var marker = "\n@@GEOMETA@@"
+  var text = String(raw || "")
+  var idx = text.lastIndexOf(marker)
+  var body = idx >= 0 ? text.slice(0, idx) : text
+  var meta = idx >= 0 ? text.slice(idx + marker.length) : ""
+  var httpCode = 0
+  var retryAfterSeconds = 0
+  if (meta) {
+    var sep = meta.indexOf("@@")
+    var codeStr = sep >= 0 ? meta.slice(0, sep) : meta
+    httpCode = parseInt(codeStr, 10) || 0
+    if (sep >= 0) {
+      try {
+        var headers = JSON.parse(meta.slice(sep + 2))
+        var ra = headers["retry-after"]
+        if (Array.isArray(ra) && ra.length > 0) {
+          var n = parseInt(ra[0], 10)
+          if (isFinite(n) && n > 0) retryAfterSeconds = n
+        }
+      } catch (e) {
+        // Headers weren't valid JSON -- fine, retryAfterSeconds just stays 0
+        // and the caller falls back to its own exponential backoff.
+      }
+    }
+  }
+  var country = null
   try {
-    var item = JSON.parse(raw)
-    if (!item || item.success !== true) return null
-    return {
-      countryCode: String(item.country_code || ""),
-      country: String(item.country || "")
+    var item = JSON.parse(body)
+    if (item && item.success === true) {
+      country = {
+        countryCode: String(item.country_code || ""),
+        country: String(item.country || "")
+      }
     }
   } catch (e) {
-    return null
+    // Not valid JSON (e.g. an HTML error page) -- country stays null.
   }
+  return { country: country, httpCode: httpCode, retryAfterSeconds: retryAfterSeconds }
 }
 
 // -- `ss -tiepn` parsing (TCP, extended info, process, numeric ports) --------

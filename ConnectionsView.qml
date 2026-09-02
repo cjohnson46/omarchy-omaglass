@@ -122,7 +122,7 @@ Column {
                 text: panel.flagFor(rowItem.modelData.remoteIp)
                 color: Color.popups.text
                 font.family: Style.font.family
-                font.pixelSize: Style.font.caption
+                font.pixelSize: Style.font.body
                 anchors.verticalCenter: parent.verticalCenter
               }
               Rectangle {
