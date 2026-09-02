@@ -613,13 +613,39 @@ Panel {
   // actually clears.
   readonly property int geoBackoffMaxMs: 1800000
 
+  // Proactive pacing, independent of the reactive backoff above: without
+  // this, a burst of many distinct new remote IPs at once (e.g. opening
+  // Connections for the first time with a couple dozen active
+  // connections) would fire that many lookups back-to-back, limited only
+  // by network round-trip time -- easily several requests per second,
+  // which risks tripping a per-second rate limit on its own before ever
+  // accumulating toward a longer-window quota. One request per second is
+  // still fast enough that a real connections list finishes resolving
+  // within a few seconds, while staying a conservative, unhurried rate
+  // against a free public service.
+  readonly property int geoMinIntervalMs: 1000
+  property real geoLastRequestAt: 0
+
   function processNextGeoLookup() {
     if (root.geoLookupTarget !== "" || root.pendingGeoQueue.length === 0) return
     if (Date.now() < root.geoBackoffUntil) return
+    var sinceLast = Date.now() - root.geoLastRequestAt
+    if (sinceLast < root.geoMinIntervalMs) {
+      geoPaceTimer.interval = Math.max(1, root.geoMinIntervalMs - sinceLast)
+      geoPaceTimer.restart()
+      return
+    }
     var q = root.pendingGeoQueue.slice()
     root.geoLookupTarget = q.shift()
     root.pendingGeoQueue = q
+    root.geoLastRequestAt = Date.now()
     geoProc.running = true
+  }
+
+  Timer {
+    id: geoPaceTimer
+    repeat: false
+    onTriggered: root.processNextGeoLookup()
   }
 
   Process {
@@ -1164,9 +1190,9 @@ Panel {
   // ---- popup content ---------------------------------------------------------
 
   // Pixels of scroll per unit of WheelEvent.angleDelta.y (typically ±120 for
-  // one physical notch, smaller/continuous for a trackpad). Roughly 3x a
+  // one physical notch, smaller/continuous for a trackpad). Roughly 6x a
   // plain Flickable's own default notch step -- see the WheelHandler below.
-  readonly property real wheelScrollScale: 0.75
+  readonly property real wheelScrollScale: 1.5
 
   KeyboardPanel {
     id: panel
