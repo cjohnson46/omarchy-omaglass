@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.cjohnson46.omaglass",
+  "name": "OmaGlass",
+  "version": "0.3.0",
+  "author": "Chris Johnson",
+  "license": "MIT",
+  "description": "A live network traffic monitor: speed gauges, a history graph, active connections with country lookups, and LAN device discovery",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "OmaGlass",
+    "description": "Live traffic gauges, connection list with IPs/country flags, and LAN device discovery",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
