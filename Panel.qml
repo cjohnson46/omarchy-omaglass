@@ -122,26 +122,89 @@ Panel {
   // directly: resampled the same underlying data at ~150 recompute times
   // spread unevenly across a 5-second span and confirmed zero of the
   // settled (non-newest-edge) buckets ever changed value.
-  function resampleByTime(times, values, windowSeconds, outputPoints) {
-    var out = new Array(outputPoints)
+  // `overscan` (optional) extends the returned array with that many EXTRA
+  // buckets immediately BEFORE the window, same fixed epoch-aligned grid,
+  // prepended in chronological order. Omit it (or pass 0) for the original
+  // exactly-`outputPoints` behavior. See graphOverscanPoints below for why
+  // these extra buckets exist.
+  function resampleByTime(times, values, windowSeconds, outputPoints, overscan) {
+    var extra = overscan || 0
+    var total = outputPoints + extra
+    var out = new Array(total)
     if (times.length === 0) {
-      for (var z = 0; z < outputPoints; z++) out[z] = 0
+      for (var z = 0; z < total; z++) out[z] = 0
       return out
     }
     var stepMs = (windowSeconds * 1000) / Math.max(1, outputPoints - 1)
     var currentSlot = Math.floor(Date.now() / stepMs)
     var idx = 0
     var n = times.length
-    for (var i = 0; i < outputPoints; i++) {
-      var slot = currentSlot - (outputPoints - 1) + i
+    for (var i = 0; i < total; i++) {
+      var slot = currentSlot - (total - 1) + i
       var slotEndMs = (slot + 1) * stepMs
       while (idx < n - 1 && times[idx + 1] < slotEndMs) idx++
       out[i] = times[idx] < slotEndMs ? values[idx] : 0
     }
     return out
   }
-  readonly property var windowedDownHistory: resampleByTime(sampleTimes, downHistory, historyWindowSeconds, historyWindowSeconds)
-  readonly property var windowedUpHistory: resampleByTime(sampleTimes, upHistory, historyWindowSeconds, historyWindowSeconds)
+
+  // How many real buckets before the visible window BandwidthGraph gets to
+  // see, purely so it always has a genuine left-hand neighbor to spline
+  // against. Without this, the bucket that's about to become the leftmost
+  // VISIBLE point is, right up until that tick, an interior point (tangent
+  // averaged with neighbors on both sides); the instant the window slides
+  // and it becomes the new endpoint, its tangent is recomputed from only
+  // its right-hand neighbor -- a real, correct change in the curve fit, but
+  // one that visibly reshapes/kinks the line right at the left edge every
+  // tick as points age out of view. Feeding a few real trailing buckets in
+  // as permanent off-canvas neighbors keeps that point's spline math
+  // interior-style always, so nothing about its rendered shape changes
+  // right as it crosses the edge -- same buckets also double as the
+  // scroll-compensation scaffold in BandwidthGraph (see its own
+  // overscanPoints/pending-offset comments). Small and fixed regardless of
+  // window length, so this stays cheap even at the 30-minute window.
+  readonly property int graphOverscanPoints: 4
+
+  // How many grid slots (see resampleByTime above) the window has actually
+  // advanced by since the last real sample, for WAN and LAN respectively.
+  // Real sample arrivals aren't perfectly spaced -- e.g. two samples landing
+  // just inside the same time bucket advance the window by 0 slots, or a
+  // slow tick that straddles a bucket boundary can advance it by 2+ -- so
+  // this can be anything from 0 upward, not always 1. BandwidthGraph's
+  // scroll animation used to hardcode an assumption of exactly 1 slot per
+  // tick, which produced a visible snap left or right whenever the real
+  // shift didn't match that assumption; it now reads this instead. Computed
+  // here, inside the same imperative tick that bumps syncTick/lanSyncTick,
+  // rather than as a property binding, so it's a plain one-shot measurement
+  // with no re-entrancy risk.
+  property int lastWanSlot: -1
+  property int lastLanSlot: -1
+  property int wanSlotShift: 1
+  property int lanSlotShift: 1
+
+  function slotFor(nowMs, windowSeconds, outputPoints) {
+    var stepMs = (windowSeconds * 1000) / Math.max(1, outputPoints - 1)
+    return Math.floor(nowMs / stepMs)
+  }
+
+  // A window-size change (user picks a different Traffic-tab button)
+  // redefines what a "slot" even is (different stepMs), so any
+  // previously-tracked slot number is meaningless against the new grid --
+  // reset rather than let it produce a bogus giant jump.
+  onHistoryWindowSecondsChanged: {
+    root.lastWanSlot = -1
+    root.lastLanSlot = -1
+  }
+
+  readonly property var windowedDownHistoryFull: resampleByTime(sampleTimes, downHistory, historyWindowSeconds, historyWindowSeconds, graphOverscanPoints)
+  readonly property var windowedUpHistoryFull: resampleByTime(sampleTimes, upHistory, historyWindowSeconds, historyWindowSeconds, graphOverscanPoints)
+  // Unchanged shape/semantics for every existing consumer (hover-tooltip
+  // value lookups included) -- exactly `historyWindowSeconds` points, same
+  // as before graphOverscanPoints existed.
+  readonly property var windowedDownHistory: windowedDownHistoryFull.slice(graphOverscanPoints)
+  readonly property var windowedUpHistory: windowedUpHistoryFull.slice(graphOverscanPoints)
+  readonly property var windowedDownOverscan: windowedDownHistoryFull.slice(0, graphOverscanPoints)
+  readonly property var windowedUpOverscan: windowedUpHistoryFull.slice(0, graphOverscanPoints)
 
   // The small bar-icon graph makes no "last N real seconds" promise the
   // way the labeled Traffic-tab windows do -- it's just "recent activity
@@ -243,10 +306,14 @@ Panel {
     uh.push(u)
     if (uh.length > historyMax) uh.shift()
     upHistory = uh
+    var now2 = Date.now()
     var th = sampleTimes.slice()
-    th.push(Date.now())
+    th.push(now2)
     if (th.length > historyMax) th.shift()
     sampleTimes = th
+    var wanSlot = root.slotFor(now2, root.historyWindowSeconds, root.historyWindowSeconds)
+    root.wanSlotShift = root.lastWanSlot < 0 ? 1 : Math.max(0, wanSlot - root.lastWanSlot)
+    root.lastWanSlot = wanSlot
     root.syncTick++
   }
 
@@ -313,8 +380,12 @@ Panel {
   property var lanUpHistory: []
   // Parallel to lanDownHistory/lanUpHistory, same as sampleTimes above.
   property var lanSampleTimes: []
-  readonly property var windowedLanDownHistory: resampleByTime(lanSampleTimes, lanDownHistory, historyWindowSeconds, historyWindowSeconds)
-  readonly property var windowedLanUpHistory: resampleByTime(lanSampleTimes, lanUpHistory, historyWindowSeconds, historyWindowSeconds)
+  readonly property var windowedLanDownHistoryFull: resampleByTime(lanSampleTimes, lanDownHistory, historyWindowSeconds, historyWindowSeconds, graphOverscanPoints)
+  readonly property var windowedLanUpHistoryFull: resampleByTime(lanSampleTimes, lanUpHistory, historyWindowSeconds, historyWindowSeconds, graphOverscanPoints)
+  readonly property var windowedLanDownHistory: windowedLanDownHistoryFull.slice(graphOverscanPoints)
+  readonly property var windowedLanUpHistory: windowedLanUpHistoryFull.slice(graphOverscanPoints)
+  readonly property var windowedLanDownOverscan: windowedLanDownHistoryFull.slice(0, graphOverscanPoints)
+  readonly property var windowedLanUpOverscan: windowedLanUpHistoryFull.slice(0, graphOverscanPoints)
 
   property real prevLanReceived: -1
   property real prevLanSent: 0
@@ -362,10 +433,14 @@ Panel {
     uh.push(u)
     if (uh.length > historyMax) uh.shift()
     lanUpHistory = uh
+    var now2 = Date.now()
     var th = lanSampleTimes.slice()
-    th.push(Date.now())
+    th.push(now2)
     if (th.length > historyMax) th.shift()
     lanSampleTimes = th
+    var lanSlot = root.slotFor(now2, root.historyWindowSeconds, root.historyWindowSeconds)
+    root.lanSlotShift = root.lastLanSlot < 0 ? 1 : Math.max(0, lanSlot - root.lastLanSlot)
+    root.lastLanSlot = lanSlot
     root.lanSyncTick++
   }
 

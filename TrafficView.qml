@@ -92,6 +92,10 @@ Column {
           up: panel.windowedUpHistory.slice(),
           lanDown: panel.windowedLanDownHistory.slice(),
           lanUp: panel.windowedLanUpHistory.slice(),
+          downOverscan: panel.windowedDownOverscan.slice(),
+          upOverscan: panel.windowedUpOverscan.slice(),
+          lanDownOverscan: panel.windowedLanDownOverscan.slice(),
+          lanUpOverscan: panel.windowedLanUpOverscan.slice(),
           syncTick: panel.syncTick,
           lanSyncTick: panel.lanSyncTick
         }
@@ -106,6 +110,10 @@ Column {
     readonly property var displayUp: graphBox.paused && graphBox.frozen ? graphBox.frozen.up : panel.windowedUpHistory
     readonly property var displayLanDown: graphBox.paused && graphBox.frozen ? graphBox.frozen.lanDown : panel.windowedLanDownHistory
     readonly property var displayLanUp: graphBox.paused && graphBox.frozen ? graphBox.frozen.lanUp : panel.windowedLanUpHistory
+    readonly property var displayDownOverscan: graphBox.paused && graphBox.frozen ? graphBox.frozen.downOverscan : panel.windowedDownOverscan
+    readonly property var displayUpOverscan: graphBox.paused && graphBox.frozen ? graphBox.frozen.upOverscan : panel.windowedUpOverscan
+    readonly property var displayLanDownOverscan: graphBox.paused && graphBox.frozen ? graphBox.frozen.lanDownOverscan : panel.windowedLanDownOverscan
+    readonly property var displayLanUpOverscan: graphBox.paused && graphBox.frozen ? graphBox.frozen.lanUpOverscan : panel.windowedLanUpOverscan
     readonly property int displaySyncTick: graphBox.paused && graphBox.frozen ? graphBox.frozen.syncTick : panel.syncTick
     readonly property int displayLanSyncTick: graphBox.paused && graphBox.frozen ? graphBox.frozen.lanSyncTick : panel.lanSyncTick
 
@@ -133,10 +141,10 @@ Column {
       // comment) so WAN and LAN, arriving from two independent async
       // samples, each scroll smoothly on their own clock.
       series: [
-        { values: graphBox.displayLanDown, color: panel.lanDownColor, fillOpacity: 0.32, glow: false, staticMax: 40000, syncTick: graphBox.displayLanSyncTick },
-        { values: graphBox.displayLanUp, color: panel.lanUpColor, fillOpacity: 0.28, glow: false, staticMax: 40000, syncTick: graphBox.displayLanSyncTick },
-        { values: graphBox.displayDown, color: panel.downColor, fillOpacity: 0.66, glow: true, staticMax: 32000000, syncTick: graphBox.displaySyncTick },
-        { values: graphBox.displayUp, color: panel.upColor, fillOpacity: 0.55, glow: true, staticMax: 32000000, syncTick: graphBox.displaySyncTick }
+        { values: graphBox.displayLanDown, overscanValues: graphBox.displayLanDownOverscan, color: panel.lanDownColor, fillOpacity: 0.32, glow: false, staticMax: 40000, syncTick: graphBox.displayLanSyncTick, slotShift: panel.lanSlotShift },
+        { values: graphBox.displayLanUp, overscanValues: graphBox.displayLanUpOverscan, color: panel.lanUpColor, fillOpacity: 0.28, glow: false, staticMax: 40000, syncTick: graphBox.displayLanSyncTick, slotShift: panel.lanSlotShift },
+        { values: graphBox.displayDown, overscanValues: graphBox.displayDownOverscan, color: panel.downColor, fillOpacity: 0.66, glow: true, staticMax: 32000000, syncTick: graphBox.displaySyncTick, slotShift: panel.wanSlotShift },
+        { values: graphBox.displayUp, overscanValues: graphBox.displayUpOverscan, color: panel.upColor, fillOpacity: 0.55, glow: true, staticMax: 32000000, syncTick: graphBox.displaySyncTick, slotShift: panel.wanSlotShift }
       ]
       // Bound to the panel's real open state (and not paused), not just
       // this Canvas's own `visible` -- that stays true even while the

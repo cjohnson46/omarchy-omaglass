@@ -11,8 +11,14 @@ import qs.Commons
 // the right edge over the full second between polls instead of jumping
 // into place.
 //
-// `series` is a plain array, drawn in order: [{ values, color, fillOpacity,
-// glow, scaleGroup, staticMax, syncTick }, ...].
+// `series` is a plain array, drawn in order: [{ values, overscanValues,
+// color, fillOpacity, glow, scaleGroup, staticMax, syncTick, slotShift },
+// ...].
+//   - overscanValues: optional, a few real buckets from immediately before
+//     `values`' window (same units). Used only as off-canvas geometry --
+//     see buildPointsWithOverscan's header comment for why this exists.
+//     Omit it and this series just doesn't get the benefit (falls back to
+//     rendering `values` alone, no left-edge scaffold).
 //   - scaleGroup: series sharing this string (default "default") share one
 //     peak-based vertical scale, same as the original down/up pair; a
 //     different group (e.g. "lan") gets its own scale, so a much
@@ -62,6 +68,11 @@ Canvas {
   property var seriesClocks: [] // per-series lastSampleTime, parallel to `series`
   property var prevSyncTicks: [] // per-series previous syncTick, to detect a real change
   property var seriesCache: [] // parallel to `series`: [{points, segments}, ...]
+  // Per-series: how many sample-spacings' worth of "not yet settled into
+  // its natural position" offset remains to visually decay away, parallel
+  // to `series`. See updateClocks() below for why this can be more than 1
+  // and why it accumulates instead of just resetting.
+  property var seriesPendingOffset: []
 
   // Which sample column the mouse is currently over, -1 when not hovering.
   // A caller reads this (plus the same index into its own data arrays) to
@@ -70,7 +81,7 @@ Canvas {
   property int hoverIndex: -1
   readonly property int hoverSampleCount: {
     var n = 0
-    for (var k = 0; k < seriesCache.length; k++) n = Math.max(n, seriesCache[k].points.length)
+    for (var k = 0; k < seriesCache.length; k++) n = Math.max(n, seriesCache[k].visibleCount)
     return n
   }
 
@@ -108,26 +119,69 @@ Canvas {
   // same pass that its new points are computed, so the array-reindex and
   // the clock-reset that need to cancel each other out for a seamless
   // scroll always happen together, per series.
+  //
+  // This used to assume every real tick reindexes a series' array by
+  // exactly one sample-spacing, and reset each series to a fixed one-step
+  // pending offset accordingly. That assumption broke once the caller
+  // switched to resampling by real elapsed time (see Panel.qml's
+  // resampleByTime): a tick can now shift the window by 0, 1, 2, or more
+  // slots depending on how real sample arrivals happened to land relative
+  // to the fixed time grid. Animating a fixed one-step offset against an
+  // actual shift that wasn't 1 produced a visible snap left (actual shift
+  // bigger than assumed) or right (actual shift smaller than assumed) --
+  // exactly the "whole line jumps" symptom this fixes. Each series now
+  // carries its own `slotShift` (how many slots it actually moved this
+  // tick, from the caller) instead of a hardcoded 1.
+  //
+  // The pending offset is a carried-over accumulator, not a plain reset,
+  // so two shifts landing closer together than one full decay cycle (real
+  // sample timing isn't perfectly regular) compose correctly instead of
+  // the second clobbering the first's still-in-progress compensation:
+  // whatever hadn't finished decaying yet is added to the new shift amount
+  // rather than discarded. Verified algebraically: comparing a given real
+  // data point's actual rendered pixel position immediately before and
+  // immediately after a reindex (accounting for both its shiftX and its
+  // new array-index natural position) confirms this is exactly continuous
+  // for any sequence of shift amounts, not just the common 1-slot case.
   function updateClocks() {
     var now = Date.now()
     var newClocks = new Array(series.length)
     var newTicks = new Array(series.length)
+    var newPending = new Array(series.length)
     for (var i = 0; i < series.length; i++) {
       var tick = series[i].syncTick
       newTicks[i] = tick
       var hasTick = tick !== undefined
       var prevTick = i < prevSyncTicks.length ? prevSyncTicks[i] : undefined
       var prevClock = i < seriesClocks.length ? seriesClocks[i] : undefined
+      var prevPending = i < seriesPendingOffset.length ? seriesPendingOffset[i] : 0
       if (!hasTick) {
         newClocks[i] = root.lastSampleTime
+        newPending[i] = 0
       } else if (prevClock === undefined || tick !== prevTick) {
+        var prevProgress = (root.liveAnimation && prevClock !== undefined)
+          ? Math.max(0, Math.min(1, (now - prevClock) / root.samplePeriodMs))
+          : 1
+        var remaining = prevPending * (1 - prevProgress)
+        var shiftSlots = (series[i].slotShift !== undefined && series[i].slotShift > 0) ? series[i].slotShift : 1
+        // Clamped to how many real overscan buckets this series actually
+        // supplied (see buildPointsWithOverscan below): the rendered
+        // geometry only extends that far off the left edge, and a huge
+        // one-off catch-up (e.g. the popup reopening after being closed a
+        // while) doesn't need a smooth animated sweep anyway -- it's fine
+        // for that one tick to settle immediately rather than fly in from
+        // off-screen.
+        var overscanLimit = (series[i].overscanValues || []).length
+        newPending[i] = Math.min(remaining + shiftSlots, overscanLimit > 0 ? overscanLimit : 0)
         newClocks[i] = now
       } else {
+        newPending[i] = prevPending
         newClocks[i] = prevClock
       }
     }
     seriesClocks = newClocks
     prevSyncTicks = newTicks
+    seriesPendingOffset = newPending
   }
 
   onSeriesChanged: scheduleRebuild()
@@ -190,18 +244,46 @@ Canvas {
   // multi-megabyte burst no longer read as roughly the same "high".
   readonly property real curveExponent: 0.16
 
-  function buildPoints(values, maxVal) {
-    var pts = []
-    var n = values.length
-    var step = n > 1 ? width / (n - 1) : width
+  // `overscanCount` real buckets from immediately before the visible window
+  // (see Panel.qml's graphOverscanPoints) are prepended at negative x,
+  // naturally clipped by the canvas until the scroll-compensation offset in
+  // onPaint below reveals them. This solves two things at once, both from
+  // the same root cause -- the leftmost VISIBLE bucket having no real left
+  // neighbor:
+  //   - Without geometry already sitting there, that offset (shifting the
+  //     whole curve right by up to a few steps right after a tick, easing
+  //     back to 0) temporarily reveals empty canvas at the left edge, which
+  //     read as a chunk of the graph visibly missing every tick (worst in
+  //     30s/2m views, where one step is a much bigger fraction of the
+  //     width).
+  //   - Every tick, the bucket about to become the new leftmost visible
+  //     point flips from an interior point (tangent averaged with
+  //     neighbors on both sides, in computeSegments below) to an endpoint
+  //     (tangent from its right-hand neighbor only) the instant the window
+  //     slides -- a real change in the curve fit that visibly reshaped/
+  //     kinked the line right at the left edge every tick as points aged
+  //     out of view, independent of the gap above.
+  // Treating overscan and visible values as one continuous array for both
+  // smoothing and spline-fitting (rather than fitting the visible range
+  // alone and separately extrapolating a few points to patch the edge)
+  // means the leftmost visible point's tangent is always computed the
+  // interior way, every tick, so nothing about its rendered shape changes
+  // as it crosses the boundary.
+  function buildPointsWithOverscan(overscanValues, visibleValues, maxVal) {
+    var overscanCount = overscanValues.length
+    var visibleCount = visibleValues.length
+    var total = overscanCount + visibleCount
+    var step = visibleCount > 1 ? width / (visibleCount - 1) : width
     var mv = maxVal > 0 ? maxVal : 1
-    for (var i = 0; i < n; i++) {
-      var v = Math.max(0, Number(values[i]) || 0)
+    var pts = new Array(total)
+    for (var i = 0; i < total; i++) {
+      var raw = i < overscanCount ? overscanValues[i] : visibleValues[i - overscanCount]
+      var v = Math.max(0, Number(raw) || 0)
       var lin = Math.max(0, Math.min(1, v / mv))
       var norm = lin > 0 ? Math.pow(lin, root.curveExponent) : 0
-      var x = n > 1 ? i * step : width
+      var x = visibleCount > 1 ? (i - overscanCount) * step : width
       var y = height - norm * Math.max(1, height - 2) - 1
-      pts.push({ x: x, y: y })
+      pts[i] = { x: x, y: y }
     }
     return pts
   }
@@ -329,9 +411,19 @@ Canvas {
     // Groups made only of auto-scaled series still share one peak-based max
     // the way the original down/up pair always did.
     var smoothedList = new Array(series.length)
+    var smoothedOverscanList = new Array(series.length)
     var groupPeak = {}
     for (var i = 0; i < series.length; i++) {
-      smoothedList[i] = smoothSeries(series[i].values || [])
+      var overscanRaw = series[i].overscanValues || []
+      var visibleRaw = series[i].values || []
+      // Smoothed as one continuous array, then split -- smoothing the
+      // overscan and visible ranges separately would leave a seam right at
+      // the join (smoothSeries leaves each array's own endpoints alone),
+      // defeating the point of treating them as one continuous curve.
+      var combinedSmoothed = smoothSeries(overscanRaw.concat(visibleRaw))
+      var oc = overscanRaw.length
+      smoothedOverscanList[i] = combinedSmoothed.slice(0, oc)
+      smoothedList[i] = combinedSmoothed.slice(oc)
       if (series[i].staticMax !== undefined) continue
       var group = series[i].scaleGroup || "default"
       var peak = seriesMax(smoothedList[i])
@@ -347,8 +439,8 @@ Canvas {
         var g = series[j].scaleGroup || "default"
         maxVal = (groupPeak[g] || 0) * 1.45
       }
-      var pts = buildPoints(smoothedList[j], maxVal)
-      cache.push({ points: pts, segments: computeSegments(pts) })
+      var allPts = buildPointsWithOverscan(smoothedOverscanList[j], smoothedList[j], maxVal)
+      cache.push({ points: allPts, segments: computeSegments(allPts), visibleCount: smoothedList[j].length })
     }
     seriesCache = cache
   }
@@ -402,19 +494,24 @@ Canvas {
     for (var i = 0; i < series.length && i < seriesCache.length; i++) {
       var s = series[i]
       var c = seriesCache[i]
-      var n = c.points.length
+      var n = c.visibleCount
       var step = n > 1 ? width / (n - 1) : 0
       var clock = i < seriesClocks.length ? seriesClocks[i] : root.lastSampleTime
+      var pending = i < seriesPendingOffset.length ? seriesPendingOffset[i] : 0
       var progress = root.liveAnimation
         ? Math.max(0, Math.min(1, (now - clock) / root.samplePeriodMs))
         : 1
-      // The newest sample lands at the right edge (shiftX 0) and glides
-      // left by exactly one sample-spacing over the second, so it comes to
-      // rest right where the next sample will land -- a continuous scroll
-      // with no snap at the second boundary. Each series uses its OWN
-      // clock, so WAN and LAN scroll independently and correctly even
-      // though their data arrives at different real moments.
-      var shiftX = n > 1 ? -step * progress : 0
+      // Right when a tick lands, the array has already reindexed onto its
+      // new natural positions, so this renders with a compensating offset
+      // (pending sample-spacings' worth) that makes it look like nothing
+      // moved yet, then eases that offset down to 0 over the following
+      // second -- a continuous glide left with no snap, ending exactly at
+      // rest by the time the next sample is expected. Each series uses its
+      // OWN clock and its own actually-observed pending amount (see
+      // updateClocks() above), so WAN and LAN scroll independently and
+      // correctly even though their data arrives at different real moments
+      // and can shift by different amounts each tick.
+      var shiftX = n > 1 ? step * pending * (1 - progress) : 0
       var pts = shiftX !== 0 ? shiftPoints(c.points, shiftX) : c.points
       var segs = shiftX !== 0 ? shiftSegments(c.segments, shiftX) : c.segments
       var fillOpacity = s.fillOpacity !== undefined ? s.fillOpacity : 0.6
