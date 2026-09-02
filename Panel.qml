@@ -57,6 +57,10 @@ Panel {
 
   property var downHistory: []
   property var upHistory: []
+  // Parallel to downHistory/upHistory (same push/shift, same length,
+  // always) -- the wall-clock time each entry was actually sampled at. See
+  // resampleByTime() below for why this exists.
+  property var sampleTimes: []
   property real downRate: 0
   property real upRate: 0
   property real peakDown: 0
@@ -74,31 +78,64 @@ Panel {
   // without touching the saved default.
   property int historyWindowSeconds: defaultHistoryWindowSeconds
 
-  // Padded with leading zeros to always be exactly historyWindowSeconds long,
-  // even in the first minutes of a session before that much real history
-  // exists. Without this, the graph's point count grew by one every second
-  // until the window filled -- and since each point is spaced width/(n-1)
-  // apart, a growing n means the pixel spacing shrinks every single rebuild,
-  // so the whole curve visibly compresses leftward instead of scrolling.
-  // That's what made the graph look like it "didn't scroll properly" until
-  // a full window's worth of history had accumulated: below that, every
-  // point was being repositioned every second, not just the newest one.
-  function padToWindow(values, targetLength) {
-    var n = targetLength !== undefined ? targetLength : historyWindowSeconds
+  // Resamples (times, values) onto exactly `outputPoints`, evenly spaced
+  // across the last `windowSeconds` of real wall-clock time, holding each
+  // point at the most recent real sample at or before it (zero before any
+  // real data existed yet, e.g. the first minutes of a session or a window
+  // longer than the session so far).
+  //
+  // This is deliberately NOT "the last N raw array entries": background
+  // sampling backs off from 1s to 4s while the popup is closed to save
+  // CPU/process-spawn overhead (see samplingIntervalMs below) -- a plain
+  // slice-the-last-N-samples window quietly represented anywhere from 2 to
+  // 8 real minutes depending on how much of that time the popup happened
+  // to be closed, so reopening after being away for a couple of minutes
+  // looked like the graph had "barely moved" even though sampling never
+  // actually stopped -- most of the visible window was still old,
+  // pre-close data. Resampling by actual elapsed time keeps "2m" meaning
+  // the last 2 real minutes regardless of how the sampling rate varied
+  // getting there, at the cost of a flat/held stretch during any span that
+  // was genuinely only sampled coarsely -- an honest gap, not invented
+  // motion.
+  //
+  // A fixed `outputPoints` (rather than however many raw samples exist)
+  // is what keeps the graph's pixel spacing constant frame to frame --
+  // see BandwidthGraph.qml for what a shifting point count used to do to
+  // the scroll.
+  function resampleByTime(times, values, windowSeconds, outputPoints) {
+    var out = new Array(outputPoints)
+    if (times.length === 0) {
+      for (var z = 0; z < outputPoints; z++) out[z] = 0
+      return out
+    }
+    var now = Date.now()
+    var spanMs = windowSeconds * 1000
+    var idx = 0
+    var n = times.length
+    for (var i = 0; i < outputPoints; i++) {
+      var t = now - spanMs + (outputPoints > 1 ? (spanMs * i) / (outputPoints - 1) : spanMs)
+      while (idx < n - 1 && times[idx + 1] <= t) idx++
+      out[i] = times[idx] <= t ? values[idx] : 0
+    }
+    return out
+  }
+  readonly property var windowedDownHistory: resampleByTime(sampleTimes, downHistory, historyWindowSeconds, historyWindowSeconds)
+  readonly property var windowedUpHistory: resampleByTime(sampleTimes, upHistory, historyWindowSeconds, historyWindowSeconds)
+
+  // The small bar-icon graph makes no "last N real seconds" promise the
+  // way the labeled Traffic-tab windows do -- it's just "recent activity
+  // at a glance" -- so it keeps the simpler last-N-raw-samples behavior,
+  // zero-padded until that many samples exist.
+  function lastNRaw(values, n) {
     var raw = values.slice(Math.max(0, values.length - n))
     if (raw.length >= n) return raw
     var padded = new Array(n - raw.length)
     for (var i = 0; i < padded.length; i++) padded[i] = 0
     return padded.concat(raw)
   }
-  readonly property var windowedDownHistory: padToWindow(downHistory)
-  readonly property var windowedUpHistory: padToWindow(upHistory)
-
-  // Same fixed-length padding, for the small bar-icon graph (40 samples)
-  // independent of the popup's selected window.
   readonly property int barHistoryPoints: 40
-  readonly property var barDownHistory: padToWindow(downHistory, barHistoryPoints)
-  readonly property var barUpHistory: padToWindow(upHistory, barHistoryPoints)
+  readonly property var barDownHistory: lastNRaw(downHistory, barHistoryPoints)
+  readonly property var barUpHistory: lastNRaw(upHistory, barHistoryPoints)
 
   property real prevRxBytes: -1
   property real prevTxBytes: -1
@@ -185,6 +222,10 @@ Panel {
     uh.push(u)
     if (uh.length > historyMax) uh.shift()
     upHistory = uh
+    var th = sampleTimes.slice()
+    th.push(Date.now())
+    if (th.length > historyMax) th.shift()
+    sampleTimes = th
     root.syncTick++
   }
 
@@ -249,8 +290,10 @@ Panel {
 
   property var lanDownHistory: []
   property var lanUpHistory: []
-  readonly property var windowedLanDownHistory: padToWindow(lanDownHistory)
-  readonly property var windowedLanUpHistory: padToWindow(lanUpHistory)
+  // Parallel to lanDownHistory/lanUpHistory, same as sampleTimes above.
+  property var lanSampleTimes: []
+  readonly property var windowedLanDownHistory: resampleByTime(lanSampleTimes, lanDownHistory, historyWindowSeconds, historyWindowSeconds)
+  readonly property var windowedLanUpHistory: resampleByTime(lanSampleTimes, lanUpHistory, historyWindowSeconds, historyWindowSeconds)
 
   property real prevLanReceived: -1
   property real prevLanSent: 0
@@ -298,6 +341,10 @@ Panel {
     uh.push(u)
     if (uh.length > historyMax) uh.shift()
     lanUpHistory = uh
+    var th = lanSampleTimes.slice()
+    th.push(Date.now())
+    if (th.length > historyMax) th.shift()
+    lanSampleTimes = th
     root.lanSyncTick++
   }
 
