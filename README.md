@@ -1,9 +1,13 @@
 # OmaGlass
 
+![OmaGlass](hero.png)
+
 A live network traffic monitor for the [Omarchy](https://omarchy.org/) shell —
 speed gauges, a history graph, active connections with country lookups and
 on-demand whois, per-app/host/type/country usage breakdowns, and LAN device
 discovery. Read-only: no firewall or blocking controls.
+
+## Screenshot
 
 ![OmaGlass traffic graph](screenshots/traffic.png)
 
