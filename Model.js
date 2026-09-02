@@ -157,30 +157,116 @@ function parseNeighbors(raw) {
 // unicast address is treated as private (fails closed), since the only
 // consequence of a false positive here is skipping a GeoIP/whois lookup,
 // while a false negative would leak a non-routable address externally.
+// Parses a textual IPv6 address into its 8 uint16 groups (expanding "::"
+// and an embedded trailing IPv4 tail), or returns null for anything that
+// isn't a syntactically valid address. Used instead of matching against a
+// few literal string prefixes (the previous approach): "fe80:" as a
+// literal prefix, for instance, only ever matched that one exact spelling
+// and missed the rest of fe80::/10 (fe81:: through febf:: are equally
+// link-local), and any other malformed-but-colon-containing string that
+// didn't happen to start with one of the listed prefixes fell through to
+// "not private" -- fail-open on exactly the input this function exists to
+// catch. Structural parsing plus numeric range checks below are correct
+// regardless of case, "::" compression, or an embedded IPv4 tail.
+function parseIPv6Groups(raw) {
+  var s = String(raw).split("%")[0] // strip a zone id (fe80::1%eth0) if present
+  if (s === "") return null
+  var halves = s.split("::")
+  if (halves.length > 2) return null // more than one "::" is never valid
+
+  function splitNonEmpty(p) { return p === "" ? [] : p.split(":") }
+  var head = splitNonEmpty(halves[0])
+  var tail = halves.length === 2 ? splitNonEmpty(halves[1]) : []
+
+  // An embedded IPv4 tail (a:b:c:d:e:f:1.2.3.4) only ever appears as the
+  // last group -- expand it into two 16-bit groups up front so the rest of
+  // this function only ever deals in plain hex groups.
+  function expandEmbeddedV4(list) {
+    if (list.length === 0) return list
+    var last = list[list.length - 1]
+    if (last.indexOf(".") === -1) return list
+    var octets = last.split(".")
+    if (octets.length !== 4) return null
+    var nums = []
+    for (var i = 0; i < 4; i++) {
+      if (!/^(0|[1-9][0-9]{0,2})$/.test(octets[i])) return null
+      var n = Number(octets[i])
+      if (n > 255) return null
+      nums.push(n)
+    }
+    var g1 = ((nums[0] << 8) | nums[1]).toString(16)
+    var g2 = ((nums[2] << 8) | nums[3]).toString(16)
+    return list.slice(0, -1).concat([g1, g2])
+  }
+  head = expandEmbeddedV4(head)
+  tail = expandEmbeddedV4(tail)
+  if (head === null || tail === null) return null
+
+  function toNums(list) {
+    var out = []
+    for (var i = 0; i < list.length; i++) {
+      if (!/^[0-9a-fA-F]{1,4}$/.test(list[i])) return null
+      out.push(parseInt(list[i], 16))
+    }
+    return out
+  }
+  var headNums = toNums(head)
+  var tailNums = toNums(tail)
+  if (headNums === null || tailNums === null) return null
+
+  if (halves.length === 1) {
+    return headNums.length === 8 ? headNums : null
+  }
+  var missing = 8 - headNums.length - tailNums.length
+  if (missing < 0) return null
+  var zeros = []
+  for (var z = 0; z < missing; z++) zeros.push(0)
+  return headNums.concat(zeros, tailNums)
+}
+
 function isPrivateIp(ip) {
   var s = String(ip || "").trim()
   if (!s) return true
   if (s === "127.0.0.1" || s === "::1" || s === "::" || s === "localhost") return true
 
   if (s.indexOf(":") !== -1) {
-    var lower = s.toLowerCase()
-    // IPv4-mapped IPv6 (::ffff:a.b.c.d) -- re-check the embedded IPv4.
-    var mapped = lower.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/)
-    if (mapped) return isPrivateIp(mapped[1])
-    if (lower.indexOf("fe80:") === 0) return true // link-local, fe80::/10 (practical form)
-    if (lower.indexOf("fc") === 0 || lower.indexOf("fd") === 0) return true // unique local, fc00::/7
-    if (lower.indexOf("ff") === 0) return true // multicast, ff00::/8
-    if (lower.indexOf("2001:db8") === 0) return true // documentation, 2001:db8::/32
-    if (lower.indexOf("::") === 0 && lower !== "::") return true // catches any other all-zero-prefixed edge case conservatively
+    var groups = parseIPv6Groups(s.toLowerCase())
+    if (!groups) return true // unparseable -- fail closed
+    // IPv4-mapped (::ffff:a.b.c.d): groups 0-3 zero, group 4 zero, group 5
+    // all-ones -- re-check the embedded IPv4 address itself.
+    if (groups[0] === 0 && groups[1] === 0 && groups[2] === 0 && groups[3] === 0
+        && groups[4] === 0 && groups[5] === 0xffff) {
+      var v4 = ((groups[6] >> 8) & 0xff) + "." + (groups[6] & 0xff) + "."
+        + ((groups[7] >> 8) & 0xff) + "." + (groups[7] & 0xff)
+      return isPrivateIp(v4)
+    }
+    var g0 = groups[0]
+    if ((g0 & 0xffc0) === 0xfe80) return true // link-local, fe80::/10 (all of it, not just the literal "fe80:" spelling)
+    if ((g0 & 0xfe00) === 0xfc00) return true // unique local, fc00::/7
+    if ((g0 & 0xff00) === 0xff00) return true // multicast, ff00::/8
+    if (groups[0] === 0x2001 && groups[1] === 0x0db8) return true // documentation, 2001:db8::/32
+    var allZero = true
+    for (var gi = 0; gi < 8; gi++) if (groups[gi] !== 0) allZero = false
+    if (allZero) return true // "::" itself, already caught above, plus any equivalent expanded form
     return false
   }
 
   var parts = s.split(".")
   if (parts.length !== 4) return true
-  var a = Number(parts[0])
-  var b = Number(parts[1])
-  var c = Number(parts[2])
-  if (!isFinite(a) || !isFinite(b) || !isFinite(c) || a < 0 || a > 255 || b < 0 || b > 255 || c < 0 || c > 255) return true
+  var nums = []
+  for (var i = 0; i < 4; i++) {
+    // Every octet, not just the first three (the previous version never
+    // looked at parts[3] at all -- a garbage/out-of-range fourth octet
+    // like "8.8.8.999" or "8.8.8.abc" fell through every check below and
+    // came back "not private"). Canonical decimal only -- no leading
+    // zeros, sign, or whitespace, which a loose Number() coercion would
+    // otherwise accept.
+    if (!/^(0|[1-9][0-9]{0,2})$/.test(parts[i])) return true
+    var n = Number(parts[i])
+    if (n > 255) return true
+    nums.push(n)
+  }
+  var a = nums[0], b = nums[1], c = nums[2]
   if (a === 0) return true // "this network", 0.0.0.0/8
   if (a === 10) return true // RFC1918, 10/8
   if (a === 100 && b >= 64 && b <= 127) return true // CGNAT, 100.64/10

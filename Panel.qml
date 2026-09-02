@@ -702,6 +702,23 @@ Panel {
     return conn.process + "|" + conn.localPort + "|" + conn.remoteIp + "|" + conn.remotePort + "|" + conn.protocol
   }
 
+  // Single-flight: at most one whoisProc invocation is ever actually
+  // running at a time. Clicking a second row while the first is still in
+  // flight used to just overwrite whoisProc.targetIp and start a second
+  // run "on top of" the first (or race with whatever Process.running=true
+  // on an already-running Process actually does) -- since the completion
+  // guard compared two properties (whoisProc.targetIp and root.whoisIp)
+  // that a second click ALSO overwrites, both could end up agreeing with
+  // each other again by the time the FIRST (stale) response arrived,
+  // making it look like a match for the second request and displaying the
+  // wrong IP's data. Killing the in-flight process and queuing the new
+  // request until it actually exits (see onRunningChanged below) means
+  // there is only ever one real request in flight, so that comparison is
+  // never fooled by a second click's overwrite landing in between.
+  property bool whoisPendingRestart: false
+  property string whoisPendingIp: ""
+  property string whoisPendingRowKey: ""
+
   function toggleWhois(rowKey, ip) {
     if (root.whoisRowKey === rowKey) {
       root.collapseWhois()
@@ -711,6 +728,13 @@ Panel {
     root.whoisIp = ip
     root.whoisText = ""
     root.whoisLoading = true
+    if (whoisProc.running) {
+      root.whoisPendingRestart = true
+      root.whoisPendingIp = ip
+      root.whoisPendingRowKey = rowKey
+      whoisProc.signal(15) // SIGTERM; onRunningChanged starts the queued request once it actually exits
+      return
+    }
     whoisProc.targetIp = ip
     whoisProc.running = true
   }
@@ -770,11 +794,32 @@ Panel {
           ;;
       esac
     `, "_", targetIp]
+    // Fires once the process has actually stopped -- including from the
+    // SIGTERM toggleWhois sends when superseding it -- so a queued request
+    // (see whoisPendingRestart above) only ever starts after the previous
+    // one is truly gone, never overlapping it.
+    onRunningChanged: {
+      if (whoisProc.running || !root.whoisPendingRestart) return
+      root.whoisPendingRestart = false
+      // The row that queued this may itself have been collapsed or
+      // superseded again while the kill was still taking effect -- only
+      // start it if it's still the one the UI is actually showing as
+      // loading.
+      if (root.whoisRowKey !== root.whoisPendingRowKey) return
+      whoisProc.targetIp = root.whoisPendingIp
+      whoisProc.running = true
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         // A second click (closing, or a different IP) may have landed
         // before this one finished -- don't overwrite with a stale result.
+        // Safe against the stale-match race a mutable-property comparison
+        // like this could otherwise have (see toggleWhois's header
+        // comment) because toggleWhois no longer lets a second request
+        // start until this one has actually stopped -- so whoisProc's own
+        // targetIp can't have been overwritten out from under an
+        // in-flight run the way it previously could.
         if (whoisProc.targetIp !== root.whoisIp || root.whoisRowKey === "") return
         root.whoisText = Model.formatWhois(text)
         root.whoisLoading = false
@@ -1030,14 +1075,36 @@ Panel {
     }
   }
 
-  FileView {
-    id: themeFile
-    path: root.stateDir + "/theme.json"
-    watchChanges: true
-    printErrors: false
-    onFileChanged: reload()
-    onLoaded: root.applyThemeFile(text())
-    onLoadFailed: root.applyThemeFile("")
+  // Reads the persisted state file once at startup through a hardened
+  // shell helper instead of FileView: FileView is a high-level Quickshell
+  // component with no exposed knobs for refusing to follow a symlink, no
+  // byte cap, and no bound on how long a read can block, so a symlink,
+  // FIFO, device, or oversized file planted at this exact path could
+  // redirect, hang, or exhaust the shared shell process on the read side
+  // even with the write side hardened. `[ -L ]`/`[ ! -f ]` reject anything
+  // but a plain regular file before ever opening it, `head -c` caps how
+  // many bytes are ever read, and the whole thing runs under `timeout` so
+  // a FIFO or device that never reaches EOF can't hang. FileView's
+  // watchChanges/live-reload isn't needed here to replace this: this
+  // plugin disallows multiple instances (see manifest.json), so nothing
+  // else ever writes this file while this instance is running, and every
+  // setter above already updates the in-memory setting directly before
+  // persisting it -- this file only ever needs to be read once, to
+  // restore whatever was saved from a previous session.
+  Process {
+    id: themeReadProc
+    running: true
+    command: ["timeout", "--kill-after=1", "3", "bash", "-c", `
+      F="$1"
+      if [ -L "$F" ]; then exit 0; fi
+      if [ -e "$F" ] && [ ! -f "$F" ]; then exit 0; fi
+      [ -f "$F" ] || exit 0
+      head -c 4096 -- "$F"
+    `, "_", root.stateDir + "/theme.json"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyThemeFile(text)
+    }
   }
 
   // Writes via a freshly-created, randomly-named temp file in the same
@@ -1049,6 +1116,22 @@ Panel {
   // or block it; an atomic rename replaces the directory entry itself
   // instead. The directory and temp file are both created privately
   // (0700/0600) rather than at the process's ambient umask.
+  //
+  // The explicit [ -L ]/[ ! -d ] checks before AND after `mkdir -p` close
+  // most of a gap plain `mkdir -p` leaves open: `-p`'s whole point is "no
+  // error if it's already there," which means it says nothing about
+  // *what* is already there -- a symlink or FIFO pre-planted at this exact
+  // path would satisfy `-p` silently and then have every future write
+  // redirected through it. One honest limitation: this is bash, which has
+  // no portable way to open a path with O_NOFOLLOW and hold that as a
+  // descriptor-relative anchor for the operations that follow, so a swap
+  // timed into the narrow window between one of these checks and the
+  // mktemp/mv that follows it isn't provably impossible the way a held
+  // no-follow directory descriptor would make it. That residual window
+  // requires an attacker already running code as this same local user
+  // against their own state directory, at which point far more direct
+  // attacks are available to them than racing this one path -- but it's a
+  // real, documented gap, not a claim of full closure.
   Process {
     id: themeWriteProc
     property string themeIdArg: ""
@@ -1057,9 +1140,12 @@ Panel {
     property string windowArg: "120"
     command: ["bash", "-c", `
       DIR="$1"
+      if [ -e "$DIR" ] && { [ -L "$DIR" ] || [ ! -d "$DIR" ]; }; then exit 1; fi
       mkdir -p -m 0700 "$DIR" || exit 1
+      if [ -L "$DIR" ] || [ ! -d "$DIR" ]; then exit 1; fi
       umask 077
       tmp=$(mktemp "$DIR/.theme.json.XXXXXX") || exit 1
+      if [ -L "$tmp" ]; then rm -f "$tmp"; exit 1; fi
       printf '{"theme":"%s","barMonotone":%s,"newAppNotifications":%s,"defaultHistoryWindowSeconds":%s}' "$2" "$3" "$4" "$5" > "$tmp"
       chmod 0600 "$tmp"
       mv -f "$tmp" "$DIR/theme.json"
