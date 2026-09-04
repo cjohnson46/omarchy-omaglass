@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.cjohnson46.omaglass",
   "name": "OmaGlass",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "author": "Chris Johnson",
   "license": "MIT",
   "description": "A live network traffic monitor: speed gauges, a history graph, active connections with country lookups, and LAN device discovery",

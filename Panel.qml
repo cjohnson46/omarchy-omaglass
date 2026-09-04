@@ -1081,8 +1081,9 @@ Panel {
     Quickshell.execDetached(["bash", "-c", "printf %s " + Util.shellQuote(String(value)) + " | wl-copy"])
   }
 
-  readonly property string stateDir: Quickshell.env("HOME") + "/.local/state/omarchy/omaglass"
-
+  // State file lives at $HOME/.local/state/omarchy/omaglass/theme.json.
+  // themeReadProc/themeWriteProc below walk to it a component at a time
+  // rather than resolving that path in one shot -- see their comments.
   readonly property var validHistoryWindows: [30, 120, 600, 1800]
 
   function applyThemeFile(raw) {
@@ -1101,81 +1102,100 @@ Panel {
     }
   }
 
-  // Reads the persisted state file once at startup through a hardened
-  // shell helper instead of FileView: FileView is a high-level Quickshell
-  // component with no exposed knobs for refusing to follow a symlink, no
-  // byte cap, and no bound on how long a read can block, so a symlink,
-  // FIFO, device, or oversized file planted at this exact path could
-  // redirect, hang, or exhaust the shared shell process on the read side
-  // even with the write side hardened. `[ -L ]`/`[ ! -f ]` reject anything
-  // but a plain regular file before ever opening it, `head -c` caps how
-  // many bytes are ever read, and the whole thing runs under `timeout` so
-  // a FIFO or device that never reaches EOF can't hang. FileView's
-  // watchChanges/live-reload isn't needed here to replace this: this
-  // plugin disallows multiple instances (see manifest.json), so nothing
-  // else ever writes this file while this instance is running, and every
-  // setter above already updates the in-memory setting directly before
-  // persisting it -- this file only ever needs to be read once, to
-  // restore whatever was saved from a previous session.
+  // Reads the persisted state file once at startup. Not FileView (a
+  // high-level component with no symlink/byte/blocking controls), and not
+  // a plain `head -c` on the full path either -- that re-walks every
+  // ancestor on the spot, following whatever symlink an attacker swapped
+  // in along the way. Instead this opens HOME and then each path
+  // component -- .local, state, omarchy, omaglass -- one at a time, each
+  // one relative to its parent's already-open descriptor via
+  // /proc/self/fd (openat() semantics). Once the walk is past a
+  // component, a symlink swapped in there can no longer redirect
+  // anything: nothing below ever names it by path again. The leaf file is
+  // opened the same way off the held directory fd and is rejected unless
+  // it is a regular file this user owns; `head -c` caps bytes and the
+  // outer `timeout` caps time, so a FIFO/device (already excluded by the
+  // `-f` test) still could not hang the shell. FileView's live-reload
+  // isn't needed: manifest.json disallows multiple instances, so nothing
+  // else writes this file while we run, and every setter updates the
+  // in-memory value directly -- the file is read once, to restore a
+  // previous session. Addresses the state-boundary blocker in the
+  // marketplace security review (omarchy-plugin-marketplace#4300).
   Process {
     id: themeReadProc
     running: true
     command: ["timeout", "--kill-after=1", "3", "bash", "-c", `
-      F="$1"
-      if [ -L "$F" ]; then exit 0; fi
-      if [ -e "$F" ] && [ ! -f "$F" ]; then exit 0; fi
-      [ -f "$F" ] || exit 0
-      head -c 4096 -- "$F"
-    `, "_", root.stateDir + "/theme.json"]
+      H="$1"
+      [ -n "$H" ] && [ -d "$H" ] && [ ! -L "$H" ] || exit 0
+      exec {dfd}<"$H" || exit 0
+      for seg in .local state omarchy omaglass; do
+        p="/proc/self/fd/$dfd/$seg"
+        [ -L "$p" ] && exit 0
+        [ -d "$p" ] || exit 0
+        prev=$dfd
+        exec {dfd}<"$p" || exit 0
+        eval "exec $prev<&-"
+      done
+      D="/proc/self/fd/$dfd"
+      [ -d "$D/." ] || exit 0
+      F="$D/theme.json"
+      [ -L "$F" ] && exit 0
+      [ -e "$F" ] && [ ! -f "$F" ] && exit 0
+      [ -f "$F" ] && [ -O "$F" ] || exit 0
+      exec {ffd}<"$F" || exit 0
+      head -c 4096 -- "/proc/self/fd/$ffd"
+    `, "_", Quickshell.env("HOME")]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.applyThemeFile(text)
     }
   }
 
-  // Writes via a freshly-created, randomly-named temp file in the same
-  // directory (mktemp's O_CREAT|O_EXCL semantics -- never following an
-  // existing name) and then an atomic rename() over the real path, rather
-  // than a plain `>` redirect to a predictable filename. `>` truncates and
-  // writes through whatever is *already* at that path, symlink included --
-  // a symlink or FIFO planted there ahead of time would redirect the write
-  // or block it; an atomic rename replaces the directory entry itself
-  // instead. The directory and temp file are both created privately
-  // (0700/0600) rather than at the process's ambient umask.
-  //
-  // The explicit [ -L ]/[ ! -d ] checks before AND after `mkdir -p` close
-  // most of a gap plain `mkdir -p` leaves open: `-p`'s whole point is "no
-  // error if it's already there," which means it says nothing about
-  // *what* is already there -- a symlink or FIFO pre-planted at this exact
-  // path would satisfy `-p` silently and then have every future write
-  // redirected through it. One honest limitation: this is bash, which has
-  // no portable way to open a path with O_NOFOLLOW and hold that as a
-  // descriptor-relative anchor for the operations that follow, so a swap
-  // timed into the narrow window between one of these checks and the
-  // mktemp/mv that follows it isn't provably impossible the way a held
-  // no-follow directory descriptor would make it. That residual window
-  // requires an attacker already running code as this same local user
-  // against their own state directory, at which point far more direct
-  // attacks are available to them than racing this one path -- but it's a
-  // real, documented gap, not a claim of full closure.
+  // Publishes the state file by atomic rename() of a freshly mktemp'd
+  // file in the same directory -- never a `>` redirect through a
+  // predictable name, which would write straight through a pre-planted
+  // symlink or FIFO. The directory is reached by the same
+  // component-at-a-time openat() walk as the reader: HOME is opened, then
+  // .local, state, omarchy, omaglass, each relative to its parent's held
+  // descriptor via /proc/self/fd, creating any missing component 0700.
+  // Everything that follows -- mktemp, chmod, mv -- names its target only
+  // as /proc/self/fd/<dirfd>/..., so once the walk is done no ancestor is
+  // ever re-resolved by path and a symlink swapped in afterward cannot
+  // redirect the temp file or the final publish. `umask 077` plus an
+  // explicit owner check keep both private; the outer `timeout` bounds
+  // the whole thing. Addresses the state-boundary blocker in the
+  // marketplace security review (omarchy-plugin-marketplace#4300). The
+  // one remaining sliver is the initial open() of HOME itself -- a single
+  // atomic syscall with no check-then-use inside it, anchored on the
+  // HOME value the shell was started with.
   Process {
     id: themeWriteProc
     property string themeIdArg: ""
     property string monotoneArg: "true"
     property string notifyArg: "false"
     property string windowArg: "120"
-    command: ["bash", "-c", `
-      DIR="$1"
-      if [ -e "$DIR" ] && { [ -L "$DIR" ] || [ ! -d "$DIR" ]; }; then exit 1; fi
-      mkdir -p -m 0700 "$DIR" || exit 1
-      if [ -L "$DIR" ] || [ ! -d "$DIR" ]; then exit 1; fi
+    command: ["timeout", "--kill-after=1", "5", "bash", "-c", `
       umask 077
-      tmp=$(mktemp "$DIR/.theme.json.XXXXXX") || exit 1
-      if [ -L "$tmp" ]; then rm -f "$tmp"; exit 1; fi
+      H="$1"
+      [ -n "$H" ] && [ -d "$H" ] && [ ! -L "$H" ] || exit 1
+      exec {dfd}<"$H" || exit 1
+      for seg in .local state omarchy omaglass; do
+        p="/proc/self/fd/$dfd/$seg"
+        [ -L "$p" ] && exit 1
+        [ -d "$p" ] || mkdir -m 0700 "$p" 2>/dev/null || true
+        { [ -d "$p" ] && [ ! -L "$p" ]; } || exit 1
+        prev=$dfd
+        exec {dfd}<"$p" || exit 1
+        eval "exec $prev<&-"
+      done
+      D="/proc/self/fd/$dfd"
+      { [ -d "$D/." ] && [ -O "$D/." ]; } || exit 1
+      tmp=$(mktemp "$D/.theme.json.XXXXXX") || exit 1
+      [ -L "$tmp" ] && { rm -f "$tmp"; exit 1; }
       printf '{"theme":"%s","barMonotone":%s,"newAppNotifications":%s,"defaultHistoryWindowSeconds":%s}' "$2" "$3" "$4" "$5" > "$tmp"
       chmod 0600 "$tmp"
-      mv -f "$tmp" "$DIR/theme.json"
-    `, "_", root.stateDir, themeIdArg, monotoneArg, notifyArg, windowArg]
+      mv -f "$tmp" "$D/theme.json"
+    `, "_", Quickshell.env("HOME"), themeIdArg, monotoneArg, notifyArg, windowArg]
   }
 
   IpcHandler {
