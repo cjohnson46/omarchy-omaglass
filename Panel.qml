@@ -321,9 +321,24 @@ Panel {
   // second while the popup is open, so a wedged call needs to die well
   // before the next tick rather than piling up -- and `head -c` bounds how
   // much output is ever buffered, regardless of what the producer writes.
+  // command[0] is an absolute path and the child gets a from-scratch
+  // environment with PATH locked to /usr/bin: without this, a bare "bash"
+  // (or anything the script below calls by name) resolves against
+  // whatever PATH this shell session happens to have, which commonly
+  // includes user-writable directories (~/.local/bin, project bin/ dirs,
+  // version-manager shims, ...) ahead of the system's own -- a bare name
+  // there would run whatever's shadowing it instead of the real binary.
+  // Clearing the environment also means an ambient BASH_ENV can't get
+  // bash to source an arbitrary file before this script ever runs.
+  // set -o pipefail: without it, this pipeline's reported exit status is
+  // always head's (near-always 0), even when the timeout/producer side
+  // was killed or crashed -- a real failure could otherwise look like a
+  // clean run to anything that later inspects the exit code.
   Process {
     id: statusProc
-    command: ["bash", "-c", "timeout --kill-after=1 3 omarchy-network-status --verbose | head -c 20000"]
+    command: ["/usr/bin/bash", "-c", "set -o pipefail; timeout --kill-after=1 3 /usr/share/omarchy/bin/omarchy-network-status --verbose | head -c 20000"]
+    clearEnvironment: true
+    environment: ({ "PATH": "/usr/bin" })
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.sample(text)
@@ -444,9 +459,14 @@ Panel {
     root.lanSyncTick++
   }
 
+  // See statusProc above for why: absolute entry point, cleared/locked-down
+  // environment, and pipefail so a killed/crashed `ss` can't be mistaken
+  // for a clean run.
   Process {
     id: lanStatsProc
-    command: ["bash", "-c", "timeout --kill-after=1 3 ss -tiepn | head -c 400000"]
+    command: ["/usr/bin/bash", "-c", "set -o pipefail; timeout --kill-after=1 3 ss -tiepn | head -c 400000"]
+    clearEnvironment: true
+    environment: ({ "PATH": "/usr/bin" })
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.sampleLan(text)
@@ -493,9 +513,13 @@ Panel {
   // hang this popup or pile up indefinitely across ticks) and `head -c`
   // bounds how much output we'll ever buffer into memory/StdioCollector,
   // regardless of how much the producer actually writes.
+  // See statusProc above for why: absolute entry point, cleared/locked-down
+  // environment, and pipefail.
   Process {
     id: connectionsProc
-    command: ["bash", "-c", "timeout --kill-after=1 4 ss -tup | head -c 400000"]
+    command: ["/usr/bin/bash", "-c", "set -o pipefail; timeout --kill-after=1 4 ss -tup | head -c 400000"]
+    clearEnvironment: true
+    environment: ({ "PATH": "/usr/bin" })
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.handleConnections(text)
@@ -560,11 +584,16 @@ Panel {
     notifyProc.running = true
   }
 
+  // Absolute entry point (this script ships under /usr/share/omarchy, not
+  // on a plain /usr/bin PATH) with a cleared, locked-down environment --
+  // see statusProc above.
   Process {
     id: notifyProc
     property string body: ""
-    command: ["omarchy-notification-send", "--app-name", "OmaGlass", "-u", "low",
+    command: ["/usr/share/omarchy/bin/omarchy-notification-send", "--app-name", "OmaGlass", "-u", "low",
       "New app on your network", body]
+    clearEnvironment: true
+    environment: ({ "PATH": "/usr/bin" })
   }
 
   // One IP looked up per request against ipwho.is over real HTTPS, queued
@@ -662,9 +691,13 @@ Panel {
     // this file) -- a rate-limit response's body and headers are exactly
     // what tells the backoff logic below how long to actually wait, so
     // this needs to see them rather than have curl discard them.
-    command: ["bash", "-c",
-      "timeout --kill-after=2 6 curl -q -sS --max-time 5 --connect-timeout 3 --proto '=https' --tlsv1.2 --max-redirs 0 \"https://ipwho.is/$1\" -w '\\n@@GEOMETA@@%{http_code}@@%{header_json}' | head -c 8200",
+    command: ["/usr/bin/bash", "-c",
+      "set -o pipefail; timeout --kill-after=2 6 curl -q -sS --max-time 5 --connect-timeout 3 --proto '=https' --tlsv1.2 --max-redirs 0 \"https://ipwho.is/$1\" -w '\\n@@GEOMETA@@%{http_code}@@%{header_json}' | head -c 8200",
       "_", root.geoLookupTarget]
+    // Absolute entry point + cleared, PATH-locked environment -- see
+    // statusProc above.
+    clearEnvironment: true
+    environment: ({ "PATH": "/usr/bin" })
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -800,13 +833,26 @@ Panel {
     // The `Process` type has no built-in run-time-limit property, so the
     // single absolute deadline for both hops together is enforced by
     // wrapping the whole bash invocation in the `timeout` command itself.
-    command: ["timeout", "--kill-after=2", "12", "bash", "-c", `
+    command: ["/usr/bin/timeout", "--kill-after=2", "12", "/usr/bin/bash", "-c", `
+      set -o pipefail
       TARGET_IP="$1"
       RIR_ALLOWLIST=" whois.arin.net whois.ripe.net whois.apnic.net whois.lacnic.net whois.afrinic.net "
+      # The outer timeout above only ever signals THIS bash process
+      # (that's how GNU timeout works: it kills the one child it forked,
+      # not the wider process tree) -- so a plain "head -c 65536 <&3"
+      # called from here would be a grandchild that survives the outer
+      # kill and keeps blocking forever on a slow-loris/black-holed peer,
+      # one leaked process per click. Each hop's connect+send+read runs
+      # under its own timeout instead, and execs straight into head so
+      # head itself becomes that timeout's direct child (exec replaces
+      # the process image rather than forking one) -- there is no longer
+      # any layer in between for a kill signal to fail to reach.
       q() {
-        exec 3<>"/dev/tcp/$1/43" || return 1
-        printf "%s\\r\\n" "$TARGET_IP" >&3
-        head -c 65536 <&3
+        /usr/bin/timeout --kill-after=1 5 /usr/bin/bash -c '
+          exec 3<>"/dev/tcp/$1/43" || exit 1
+          printf "%s\r\n" "$2" >&3
+          exec head -c 65536 <&3
+        ' _ "$1" "$TARGET_IP"
       }
       resp1=$(q whois.iana.org) || { echo "Could not reach the whois service."; exit 0; }
       refer=$(printf '%s\\n' "$resp1" | grep -i '^refer:' | head -1 | sed 's/^[Rr]efer:[[:space:]]*//' | tr -d '\\r\\n ' | tr 'A-Z' 'a-z')
@@ -820,6 +866,10 @@ Panel {
           ;;
       esac
     `, "_", targetIp]
+    // Absolute entry point + cleared, PATH-locked environment -- see
+    // statusProc above.
+    clearEnvironment: true
+    environment: ({ "PATH": "/usr/bin" })
     // Fires once the process has actually stopped -- including from the
     // SIGTERM toggleWhois sends when superseding it -- so a queued request
     // (see whoisPendingRestart above) only ever starts after the previous
@@ -861,9 +911,13 @@ Panel {
     devicesProc.running = true
   }
 
+  // See statusProc above for why: absolute entry point, cleared/locked-down
+  // environment, and pipefail.
   Process {
     id: devicesProc
-    command: ["bash", "-c", "timeout --kill-after=1 4 ip neigh show | head -c 100000"]
+    command: ["/usr/bin/bash", "-c", "set -o pipefail; timeout --kill-after=1 4 ip neigh show | head -c 100000"]
+    clearEnvironment: true
+    environment: ({ "PATH": "/usr/bin" })
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.devices = Model.parseNeighbors(text)
@@ -968,9 +1022,13 @@ Panel {
   readonly property string usageWanText: Model.formatBytes(usageWanBytes)
   readonly property string usageLanText: Model.formatBytes(usageLanBytes)
 
+  // See statusProc above for why: absolute entry point, cleared/locked-down
+  // environment, and pipefail.
   Process {
     id: usageProc
-    command: ["bash", "-c", "timeout --kill-after=1 4 ss -tiepn | head -c 400000"]
+    command: ["/usr/bin/bash", "-c", "set -o pipefail; timeout --kill-after=1 4 ss -tiepn | head -c 400000"]
+    clearEnvironment: true
+    environment: ({ "PATH": "/usr/bin" })
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.handleUsage(text)
@@ -985,9 +1043,13 @@ Panel {
     onTriggered: root.refreshUsage()
   }
 
+  // See statusProc above for why: absolute entry point, cleared/locked-down
+  // environment, and pipefail.
   Process {
     id: hostProc
-    command: ["bash", "-c", "timeout --kill-after=1 3 getent hosts \"$1\" | head -c 4000", "_", root.hostLookupTarget]
+    command: ["/usr/bin/bash", "-c", "set -o pipefail; timeout --kill-after=1 3 getent hosts \"$1\" | head -c 4000", "_", root.hostLookupTarget]
+    clearEnvironment: true
+    environment: ({ "PATH": "/usr/bin" })
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -1075,10 +1137,22 @@ Panel {
   }
 
   // Copies plain text to the system clipboard via wl-copy -- same recipe
-  // omarchy.network uses for its copyable detail rows.
+  // omarchy.network uses for its copyable detail rows. Absolute entry
+  // point + cleared, PATH-locked environment, same as every other process
+  // this plugin spawns (see statusProc) -- WAYLAND_DISPLAY/XDG_RUNTIME_DIR
+  // are passed through explicitly since wl-copy needs them to reach the
+  // compositor's clipboard, everything else ambient is dropped.
   function copyToClipboard(value) {
     if (!value) return
-    Quickshell.execDetached(["bash", "-c", "printf %s " + Util.shellQuote(String(value)) + " | wl-copy"])
+    Quickshell.execDetached({
+      command: ["/usr/bin/bash", "-c", "set -o pipefail; printf %s " + Util.shellQuote(String(value)) + " | wl-copy"],
+      clearEnvironment: true,
+      environment: {
+        "PATH": "/usr/bin",
+        "WAYLAND_DISPLAY": Quickshell.env("WAYLAND_DISPLAY"),
+        "XDG_RUNTIME_DIR": Quickshell.env("XDG_RUNTIME_DIR")
+      }
+    })
   }
 
   // State file lives at $HOME/.local/state/omarchy/omaglass/theme.json.
@@ -1111,23 +1185,47 @@ Panel {
   // one relative to its parent's already-open descriptor via
   // /proc/self/fd (openat() semantics). Once the walk is past a
   // component, a symlink swapped in there can no longer redirect
-  // anything: nothing below ever names it by path again. The leaf file is
-  // opened the same way off the held directory fd and is rejected unless
-  // it is a regular file this user owns; `head -c` caps bytes and the
-  // outer `timeout` caps time, so a FIFO/device (already excluded by the
-  // `-f` test) still could not hang the shell. FileView's live-reload
-  // isn't needed: manifest.json disallows multiple instances, so nothing
-  // else writes this file while we run, and every setter updates the
-  // in-memory value directly -- the file is read once, to restore a
-  // previous session. Addresses the state-boundary blocker in the
-  // marketplace security review (omarchy-plugin-marketplace#4300).
+  // anything: nothing below ever names it by path again.
+  //
+  // Being unable to redirect a name isn't the whole story, though: every
+  // directory in the walk -- HOME included -- is also checked, via the
+  // held descriptor's own /proc/self/fd entry (so the check is on the
+  // exact inode already open, not a path that could name something else
+  // by the time this runs), for being owned by this user with no group-
+  // or other-write bit. Skipping that would leave a real gap even with
+  // the openat-style walk: if some ancestor the walk passes through were
+  // writable by another local user or group, that party could still
+  // plant or swap out the *next* component before this ever opens it --
+  // the walk stops that component from being re-resolved by path later,
+  // but says nothing about who else could write it before the open
+  // happens at all. Checking each directory right after opening it, and
+  // before trusting anything inside it, closes that.
+  //
+  // The leaf file is opened the same way off the held directory fd and is
+  // rejected unless it is a regular file this user owns; `head -c` caps
+  // bytes and the outer `timeout` caps time, so a FIFO/device (already
+  // excluded by the `-f` test) still could not hang the shell. FileView's
+  // live-reload isn't needed: manifest.json disallows multiple instances,
+  // so nothing else writes this file while we run, and every setter
+  // updates the in-memory value directly -- the file is read once, to
+  // restore a previous session. Addresses the state-boundary blocker in
+  // the marketplace security review (omarchy-plugin-marketplace#4300,
+  // resubmitted as #6424).
   Process {
     id: themeReadProc
     running: true
-    command: ["timeout", "--kill-after=1", "3", "bash", "-c", `
+    command: ["/usr/bin/timeout", "--kill-after=1", "3", "/usr/bin/bash", "-c", `
+      check_dir() {
+        local p="/proc/self/fd/$1" perm
+        [ -d "$p" ] && [ -O "$p" ] || return 1
+        perm=$(stat -L -c '%a' "$p" 2>/dev/null) || return 1
+        (( (8#$perm) & 0022 )) && return 1
+        return 0
+      }
       H="$1"
       [ -n "$H" ] && [ -d "$H" ] && [ ! -L "$H" ] || exit 0
       exec {dfd}<"$H" || exit 0
+      check_dir "$dfd" || exit 0
       for seg in .local state omarchy omaglass; do
         p="/proc/self/fd/$dfd/$seg"
         [ -L "$p" ] && exit 0
@@ -1135,9 +1233,9 @@ Panel {
         prev=$dfd
         exec {dfd}<"$p" || exit 0
         eval "exec $prev<&-"
+        check_dir "$dfd" || exit 0
       done
       D="/proc/self/fd/$dfd"
-      [ -d "$D/." ] || exit 0
       F="$D/theme.json"
       [ -L "$F" ] && exit 0
       [ -e "$F" ] && [ ! -f "$F" ] && exit 0
@@ -1145,6 +1243,10 @@ Panel {
       exec {ffd}<"$F" || exit 0
       head -c 4096 -- "/proc/self/fd/$ffd"
     `, "_", Quickshell.env("HOME")]
+    // Absolute entry point + cleared, PATH-locked environment -- see
+    // statusProc above.
+    clearEnvironment: true
+    environment: ({ "PATH": "/usr/bin" })
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.applyThemeFile(text)
@@ -1161,24 +1263,40 @@ Panel {
   // Everything that follows -- mktemp, chmod, mv -- names its target only
   // as /proc/self/fd/<dirfd>/..., so once the walk is done no ancestor is
   // ever re-resolved by path and a symlink swapped in afterward cannot
-  // redirect the temp file or the final publish. `umask 077` plus an
-  // explicit owner check keep both private; the outer `timeout` bounds
-  // the whole thing. Addresses the state-boundary blocker in the
-  // marketplace security review (omarchy-plugin-marketplace#4300). The
-  // one remaining sliver is the initial open() of HOME itself -- a single
-  // atomic syscall with no check-then-use inside it, anchored on the
-  // HOME value the shell was started with.
+  // redirect the temp file or the final publish.
+  //
+  // As on the reader above, every directory in the walk -- HOME included
+  // -- is also checked via its own held-descriptor /proc/self/fd entry
+  // for being owned by this user with no group- or other-write bit,
+  // right after it's opened and before the next component is trusted.
+  // Without that, a writable intermediate could still swap in whatever
+  // the next path segment resolves to between our open and our use of
+  // it, openat-style walk or not. `umask 077` plus that same check keep
+  // newly-created components private; the outer `timeout` bounds the
+  // whole thing. Addresses the state-boundary blocker in the marketplace
+  // security review (omarchy-plugin-marketplace#4300, resubmitted as
+  // #6424). The one remaining sliver is the initial open() of HOME
+  // itself -- a single atomic syscall with no check-then-use inside it,
+  // anchored on the HOME value the shell was started with.
   Process {
     id: themeWriteProc
     property string themeIdArg: ""
     property string monotoneArg: "true"
     property string notifyArg: "false"
     property string windowArg: "120"
-    command: ["timeout", "--kill-after=1", "5", "bash", "-c", `
+    command: ["/usr/bin/timeout", "--kill-after=1", "5", "/usr/bin/bash", "-c", `
       umask 077
+      check_dir() {
+        local p="/proc/self/fd/$1" perm
+        [ -d "$p" ] && [ -O "$p" ] || return 1
+        perm=$(stat -L -c '%a' "$p" 2>/dev/null) || return 1
+        (( (8#$perm) & 0022 )) && return 1
+        return 0
+      }
       H="$1"
       [ -n "$H" ] && [ -d "$H" ] && [ ! -L "$H" ] || exit 1
       exec {dfd}<"$H" || exit 1
+      check_dir "$dfd" || exit 1
       for seg in .local state omarchy omaglass; do
         p="/proc/self/fd/$dfd/$seg"
         [ -L "$p" ] && exit 1
@@ -1187,15 +1305,19 @@ Panel {
         prev=$dfd
         exec {dfd}<"$p" || exit 1
         eval "exec $prev<&-"
+        check_dir "$dfd" || exit 1
       done
       D="/proc/self/fd/$dfd"
-      { [ -d "$D/." ] && [ -O "$D/." ]; } || exit 1
       tmp=$(mktemp "$D/.theme.json.XXXXXX") || exit 1
       [ -L "$tmp" ] && { rm -f "$tmp"; exit 1; }
       printf '{"theme":"%s","barMonotone":%s,"newAppNotifications":%s,"defaultHistoryWindowSeconds":%s}' "$2" "$3" "$4" "$5" > "$tmp"
       chmod 0600 "$tmp"
       mv -f "$tmp" "$D/theme.json"
     `, "_", Quickshell.env("HOME"), themeIdArg, monotoneArg, notifyArg, windowArg]
+    // Absolute entry point + cleared, PATH-locked environment -- see
+    // statusProc above.
+    clearEnvironment: true
+    environment: ({ "PATH": "/usr/bin" })
   }
 
   IpcHandler {
